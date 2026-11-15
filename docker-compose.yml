@@ -1,0 +1,27 @@
+services:
+  mailtrack:
+    build: .
+    container_name: mailtrack
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8081:8000"
+
+    volumes:
+      - /var/lib/mailtrack:/data
+
+    environment:
+      MAILTRACK_DB: /data/db/mailtrack.sqlite3
+      MAILTRACK_PHOTOS: /data/photos
+      MAILTRACK_THUMBNAILS: /data/thumbnails
+      TZ: America/Sao_Paulo
+
+    security_opt:
+      - no-new-privileges:true
+
+    networks:
+      - mailtrack_net
+
+networks:
+  mailtrack_net:
+    driver: bridge
