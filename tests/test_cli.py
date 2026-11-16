@@ -3,6 +3,7 @@
 import contextlib
 import errno
 import io
+import json
 import os
 import re
 import shutil
@@ -44,6 +45,24 @@ CREATE TABLE IF NOT EXISTS photos (
     created_at TEXT NOT NULL DEFAULT
         (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     FOREIGN KEY(message_id) REFERENCES messages(id)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    photo_id INTEGER,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL DEFAULT
+        (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    remote_ip TEXT,
+    client_ip TEXT,
+    user_agent TEXT,
+    cf_ray TEXT,
+    cf_country TEXT,
+    forwarded_for TEXT,
+    referer TEXT,
+    FOREIGN KEY(message_id) REFERENCES messages(id),
+    FOREIGN KEY(photo_id) REFERENCES photos(id)
 );
 """
 
@@ -144,6 +163,19 @@ class CliTestCase(unittest.TestCase):
             return db.execute(
                 "SELECT * FROM photos ORDER BY id DESC LIMIT 1"
             ).fetchone()
+
+    def _nova_mensagem(self, msg_id, quando, recipient="outro@example.com",
+                       subject="Nova"):
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO messages (id, recipient, subject, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (msg_id, recipient, subject, quando)
+            )
+
+    def _main(self, *argv):
+        with mock.patch.object(sys, "argv", ["mailtrack", *argv]):
+            return cli.main()
 
     def _add_photo_rows(
         self, rows=(("ORIG1", "THUMB1"), ("ORIG2", "THUMB2"))
@@ -823,6 +855,477 @@ class ExportHtmlTest(CliTestCase):
         self.assertIn("https://photos.example/t/THUMBLEG", html)
         self.assertEqual(legado.read_bytes(), conteudo_antes)
         self.assertEqual(legado.stat().st_mtime_ns, mtime_antes)
+
+
+class CliInterfaceTest(CliTestCase):
+    """CT1-CT30: resolucao de mensagem, lote, base URL, limites, saidas,
+    codigos de retorno e erros operacionais."""
+
+    def test_ct1_add_photo_usa_ultima_mensagem(self):
+        self._nova_mensagem("MSG-NOVA", "2030-01-01T00:00:00.000Z")
+
+        cli.add_photo(types.SimpleNamespace(files=[str(self.source)]))
+
+        with self._connect() as db:
+            row = db.execute("SELECT message_id FROM photos").fetchone()
+        self.assertEqual(row["message_id"], "MSG-NOVA")
+
+    def test_ct2_export_html_usa_ultima_mensagem(self):
+        self._nova_mensagem("MSG-NOVA", "2030-01-01T00:00:00.000Z")
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO photos (message_id, original_token, "
+                "thumbnail_token, filename, original_path, thumbnail_path) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("MSG-NOVA", "ONOVA", "TNOVA", "n.jpg",
+                 "/data/photos/ONOVA.jpg", "/data/thumbnails/TNOVA.jpg")
+            )
+
+        cli.export_html(types.SimpleNamespace(
+            message=None, base_url="https://photos.example", output=None
+        ))
+
+        self.assertTrue((self.exports / "MSG-NOVA.html").is_file())
+
+    def test_ct3_add_photo_mensagem_explicita_por_id(self):
+        self._nova_mensagem("MSG-NOVA", "2030-01-01T00:00:00.000Z")
+
+        cli.add_photo(types.SimpleNamespace(
+            message=self.message_id, files=[str(self.source)]
+        ))
+
+        with self._connect() as db:
+            row = db.execute("SELECT message_id FROM photos").fetchone()
+        self.assertEqual(row["message_id"], self.message_id)
+
+    def test_ct4_mensagem_inexistente_orienta_list(self):
+        with self.assertRaises(SystemExit) as contexto:
+            cli.add_photo(types.SimpleNamespace(
+                message="MSG-INEXISTENTE", files=[str(self.source)]
+            ))
+
+        self.assertEqual(contexto.exception.code, 1)
+        self.assertIn("Mensagem não encontrada", str(contexto.exception))
+        self.assertIn("mailtrack list", str(contexto.exception))
+        self.assertEqual(self._photo_count(), 0)
+        self.assertEqual(self._names(self.photos), [])
+
+    def test_ct5_sem_mensagens_orienta_create(self):
+        with self._connect() as db:
+            db.execute("DELETE FROM messages")
+
+        with self.assertRaises(SystemExit) as contexto:
+            cli.add_photo(types.SimpleNamespace(files=[str(self.source)]))
+
+        self.assertEqual(contexto.exception.code, 1)
+        self.assertIn("Nenhuma mensagem cadastrada", str(contexto.exception))
+        self.assertIn("mailtrack create", str(contexto.exception))
+
+    def test_ct6_add_photo_em_lote(self):
+        fontes = [
+            self._write_image(f"lote{i}.jpg", (300, 300))
+            for i in (1, 2, 3)
+        ]
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.add_photo(types.SimpleNamespace(
+                files=[str(fonte) for fonte in fontes]
+            ))
+
+        self.assertEqual(self._photo_count(), 3)
+        self.assertEqual(len(self._names(self.photos)), 3)
+        self.assertEqual(len(self._names(self.thumbs)), 3)
+        self.assertEqual(self._temps(self.photos), [])
+        self.assertIn("Resumo: 3 adicionada(s), 0 falha(s)", saida.getvalue())
+
+    def test_ct7_add_photo_falha_parcial_informa_e_nao_desfaz(self):
+        primeira = self._write_image("ok1.jpg", (300, 300))
+        quebrada = self.base / "in" / "ruim.jpg"
+        quebrada.write_bytes(b"isto nao e uma imagem")
+        segunda = self._write_image("ok2.jpg", (300, 300))
+        saida, erros = io.StringIO(), io.StringIO()
+
+        with contextlib.redirect_stdout(saida), \
+                contextlib.redirect_stderr(erros):
+            with self.assertRaises(SystemExit) as contexto:
+                cli.add_photo(types.SimpleNamespace(
+                    files=[str(primeira), str(quebrada), str(segunda)]
+                ))
+
+        self.assertEqual(contexto.exception.code, 1)
+        self.assertEqual(self._photo_count(), 2)
+        self.assertEqual(len(self._names(self.photos)), 2)
+        self.assertIn(
+            "Resumo: 2 adicionada(s), 1 falha(s)", saida.getvalue()
+        )
+        self.assertIn("ruim.jpg", erros.getvalue())
+
+    def test_ct8_add_photo_sintaxe_antiga(self):
+        self._nova_mensagem("MSG-AB12CD34EF", "2029-01-01T00:00:00.000Z")
+
+        cli.add_photo(types.SimpleNamespace(
+            files=["MSG-AB12CD34EF", str(self.source)]
+        ))
+
+        self.assertEqual(self._photo_count(), 1)
+        with self._connect() as db:
+            row = db.execute("SELECT message_id FROM photos").fetchone()
+        self.assertEqual(row["message_id"], "MSG-AB12CD34EF")
+
+    def test_ct9_add_photo_informa_urls(self):
+        saida = io.StringIO()
+        with mock.patch.dict(
+            os.environ, {"MAILTRACK_BASE_URL": cli.BASE_URL}
+        ), contextlib.redirect_stdout(saida):
+            cli.add_photo(types.SimpleNamespace(files=[str(self.source)]))
+
+        texto = saida.getvalue()
+        self.assertIn(f"{cli.BASE_URL}/t/", texto)
+        self.assertIn(f"{cli.BASE_URL}/o/", texto)
+        self.assertIn("OK      foto.jpg", texto)
+
+
+    def test_ct10_base_url_precedencia(self):
+        self._add_photo_rows()
+        destino = self.exports / f"{self.message_id}.html"
+
+        with mock.patch.dict(
+            os.environ, {"MAILTRACK_BASE_URL": "https://env.example"}
+        ):
+            cli.export_html(types.SimpleNamespace(
+                message=self.message_id, base_url=None, output=None
+            ))
+            self.assertIn(
+                "https://env.example/t/THUMB1",
+                destino.read_text(encoding="utf-8")
+            )
+
+            cli.export_html(types.SimpleNamespace(
+                message=self.message_id,
+                base_url="https://flag.example",
+                output=None
+            ))
+            texto = destino.read_text(encoding="utf-8")
+            self.assertIn("https://flag.example/t/THUMB1", texto)
+            self.assertNotIn("https://env.example", texto)
+
+        with mock.patch.dict(os.environ, {"MAILTRACK_BASE_URL": ""}):
+            cli.export_html(types.SimpleNamespace(
+                message=self.message_id, base_url=None, output=None
+            ))
+            self.assertIn(
+                f"{cli.BASE_URL}/t/THUMB1",
+                destino.read_text(encoding="utf-8")
+            )
+
+    def test_ct11_export_html_com_output(self):
+        self._add_photo_rows()
+        destino = self.base / "saida" / "manual.html"
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.export_html(types.SimpleNamespace(
+                message=self.message_id,
+                base_url="https://x.example",
+                output=str(destino)
+            ))
+
+        self.assertTrue(destino.is_file())
+        self.assertIn(
+            "https://x.example/t/THUMB1",
+            destino.read_text(encoding="utf-8")
+        )
+        self.assertEqual(self._temps(destino.parent), [])
+        self.assertIn("HTML gerado:", saida.getvalue())
+        self.assertIn(destino.name, saida.getvalue())
+
+    def test_ct12_export_html_imprime_proximo_passo(self):
+        cli.add_photo(self._photo_args())
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.export_html(self._export_args())
+
+        texto = saida.getvalue()
+        self.assertIn("HTML gerado:", texto)
+        self.assertIn("Próximo passo:", texto)
+
+    def test_ct13_list_marca_ultima_e_idade(self):
+        self._nova_mensagem("MSG-NOVA", "2030-01-01T00:00:00.000Z")
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.list_messages(types.SimpleNamespace(limit=None, json=False))
+
+        texto = saida.getvalue()
+        linhas = [linha for linha in texto.splitlines() if "|" in linha]
+        self.assertTrue(linhas[0].startswith("* MSG-NOVA"))
+        self.assertTrue(linhas[1].startswith("  " + self.message_id))
+        self.assertIn("agora", texto)
+        self.assertIn("* = última mensagem", texto)
+
+    def test_ct14_list_limit(self):
+        self._nova_mensagem("MSG-N1", "2029-01-01T00:00:00.000Z")
+        self._nova_mensagem("MSG-N2", "2029-06-01T00:00:00.000Z")
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.list_messages(types.SimpleNamespace(limit=2, json=False))
+
+        linhas = [linha for linha in saida.getvalue().splitlines()
+                  if "|" in linha]
+        self.assertEqual(len(linhas), 2)
+        self.assertIn("MSG-N2", linhas[0])
+        self.assertIn("MSG-N1", linhas[1])
+        self.assertTrue(linhas[0].startswith("* MSG-N2"))
+
+    def test_ct15_list_json(self):
+        self._nova_mensagem("MSG-NOVA", "2030-01-01T00:00:00.000Z")
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.list_messages(types.SimpleNamespace(limit=None, json=True))
+
+        dados = json.loads(saida.getvalue())
+        self.assertEqual(dados[0]["id"], "MSG-NOVA")
+        self.assertTrue(dados[0]["is_last"])
+        self.assertFalse(dados[1]["is_last"])
+        self.assertEqual(dados[0]["photo_count"], 0)
+        self.assertIn("age_seconds", dados[0])
+        self.assertIn("created_at", dados[0])
+
+
+    def test_ct16_show_mostra_links_e_tamanho(self):
+        cli.add_photo(self._photo_args())
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.show_message(types.SimpleNamespace(
+                message=self.message_id,
+                base_url="https://photos.example",
+                json=False
+            ))
+
+        texto = saida.getvalue()
+        self.assertIn("foto.jpg", texto)
+        self.assertIn("tamanho:", texto)
+        self.assertIn("miniatura: https://photos.example/t/", texto)
+        self.assertIn("original:  https://photos.example/o/", texto)
+
+    def test_ct17_show_json(self):
+        cli.add_photo(self._photo_args())
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            cli.show_message(types.SimpleNamespace(
+                message=None,
+                base_url="https://photos.example",
+                json=True
+            ))
+
+        dados = json.loads(saida.getvalue())
+        self.assertEqual(dados["id"], self.message_id)
+        self.assertEqual(len(dados["photos"]), 1)
+        foto = dados["photos"][0]
+        self.assertEqual(foto["filename"], "foto.jpg")
+        self.assertGreater(foto["size_bytes"], 0)
+        self.assertTrue(
+            foto["thumbnail_url"].startswith("https://photos.example/t/")
+        )
+        self.assertTrue(
+            foto["original_url"].startswith("https://photos.example/o/")
+        )
+
+    def test_ct18_history_limite_e_resumo(self):
+        with self._connect() as db:
+            for indice in range(1, 6):
+                db.execute(
+                    "INSERT INTO events (message_id, event_type, "
+                    "occurred_at) VALUES (?, ?, ?)",
+                    (self.message_id, f"evento{indice}",
+                     f"2026-11-{10 + indice:02d}T00:00:00.000Z")
+                )
+
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            cli.history(types.SimpleNamespace(
+                message=self.message_id, limit=2, summary=True
+            ))
+
+        texto = saida.getvalue()
+        linhas = [linha for linha in texto.splitlines() if linha]
+        self.assertEqual(len(linhas), 2)
+        # Os 2 mais recentes, exibidos em ordem cronológica.
+        self.assertIn("evento4", linhas[0])
+        self.assertIn("evento5", linhas[1])
+        self.assertNotIn("evento1", texto)
+        self.assertNotIn("IP visitante", texto)
+
+    def test_ct19_history_padrao_detalhado(self):
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO events (message_id, event_type) VALUES (?, ?)",
+                (self.message_id, "thumbnail_requested")
+            )
+
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            cli.history(types.SimpleNamespace(message=self.message_id))
+
+        texto = saida.getvalue()
+        self.assertIn("thumbnail_requested", texto)
+        self.assertIn("IP visitante (Cloudflare):", texto)
+        self.assertIn("User-Agent:", texto)
+
+
+    def test_ct20_version(self):
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("--version")
+
+        self.assertEqual(contexto.exception.code, 0)
+        self.assertIn(cli.VERSION, saida.getvalue())
+
+    def test_ct21_uso_invalido_retorna_2(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("create")
+
+        self.assertEqual(contexto.exception.code, 2)
+
+    def test_ct22_erro_operacional_retorna_1(self):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("export-html", "MSG-INEXISTENTE")
+
+        self.assertEqual(contexto.exception.code, 1)
+
+    def test_ct23_main_add_photo_com_mensagem_e_lote(self):
+        self._nova_mensagem("MSG-AB12CD34EF", "2029-01-01T00:00:00.000Z")
+        segunda = self._write_image("outra.jpg", (300, 300))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._main(
+                "add-photo", "--message", "MSG-AB12CD34EF",
+                str(self.source), str(segunda)
+            )
+
+        self.assertEqual(self._photo_count(), 2)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS n FROM photos WHERE message_id=?",
+                ("MSG-AB12CD34EF",)
+            ).fetchone()
+        self.assertEqual(row["n"], 2)
+
+    def test_ct24_main_fluxo_padrao(self):
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            self._main(
+                "create", "--to", "dest@example.com", "--subject", "Fotos"
+            )
+            self._main("add-photo", str(self.source))
+            self._main("export-html")
+
+        texto = saida.getvalue()
+        self.assertRegex(texto, r"Mensagem criada: MSG-[0-9A-F]{10}")
+        self.assertIn("HTML gerado:", texto)
+
+        gerados = sorted(self.exports.glob("*.html"))
+        self.assertEqual(len(gerados), 1)
+        self.assertIn("foto.jpg", gerados[0].read_text(encoding="utf-8"))
+
+
+    def test_ct25_list_limit_zero_invalido(self):
+        erros = io.StringIO()
+
+        with contextlib.redirect_stderr(erros), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("list", "--limit", "0")
+
+        self.assertEqual(contexto.exception.code, 2)
+        self.assertIn("limite", erros.getvalue())
+
+    def test_ct26_list_limit_negativo_invalido(self):
+        erros = io.StringIO()
+
+        with contextlib.redirect_stderr(erros), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("list", "--limit", "-1")
+
+        self.assertEqual(contexto.exception.code, 2)
+        self.assertIn("maior que zero", erros.getvalue())
+        self.assertIn("-1", erros.getvalue())
+
+    def test_ct27_history_limit_negativo_invalido(self):
+        erros = io.StringIO()
+
+        with contextlib.redirect_stderr(erros), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("history", "--limit", "-1")
+
+        self.assertEqual(contexto.exception.code, 2)
+        self.assertIn("não pode ser negativo", erros.getvalue())
+        self.assertIn("use 0 para todos os eventos", erros.getvalue())
+
+    def test_ct28_history_limit_zero_mostra_todos(self):
+        with self._connect() as db:
+            for indice in (1, 2, 3):
+                db.execute(
+                    "INSERT INTO events (message_id, event_type) "
+                    "VALUES (?, ?)",
+                    (self.message_id, f"evento{indice}")
+                )
+
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            self._main("history", "--limit", "0", "--summary")
+
+        linhas = [linha for linha in saida.getvalue().splitlines() if linha]
+        self.assertEqual(len(linhas), 3)
+        self.assertIn("evento1", saida.getvalue())
+        self.assertIn("evento3", saida.getvalue())
+
+    def test_ct29_erro_de_io_vira_mensagem_e_codigo_1(self):
+        self._add_photo_rows()
+        erros = io.StringIO()
+
+        with mock.patch.object(
+            cli,
+            "_stage_html",
+            side_effect=OSError(errno.ENOSPC, "No space left on device")
+        ), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(erros), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("export-html")
+
+        self.assertEqual(contexto.exception.code, 1)
+        texto = erros.getvalue()
+        self.assertIn("Erro operacional (OSError)", texto)
+        self.assertIn("No space left on device", texto)
+        self.assertNotIn("Traceback", texto)
+
+    def test_ct30_erro_de_banco_vira_mensagem_e_codigo_1(self):
+        erros = io.StringIO()
+
+        with mock.patch.object(
+            cli,
+            "connect",
+            side_effect=sqlite3.OperationalError("database is locked")
+        ), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(erros), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("list")
+
+        self.assertEqual(contexto.exception.code, 1)
+        texto = erros.getvalue()
+        self.assertIn("Erro operacional (OperationalError)", texto)
+        self.assertIn("database is locked", texto)
+        self.assertNotIn("Traceback", texto)
 
 
 if __name__ == "__main__":

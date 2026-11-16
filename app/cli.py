@@ -1,10 +1,13 @@
 import argparse
+import json
 import os
+import re
 import secrets
 import shutil
 import sqlite3
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from html import escape
 
@@ -22,6 +25,8 @@ ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".tif", ".tiff", ".bmp"}
 # Miniatura: arquivo 240x240 (quadrado, corte central) exibido em 120x120 no HTML.
 THUMB_PX = 240
 THUMB_DISPLAY_PX = 120
+
+VERSION = "0.2.0"
 
 
 def connect():
@@ -115,6 +120,153 @@ def _discard(paths: list[Path]) -> None:
             )
 
 
+class _Abort(SystemExit):
+    """Erro operacional: mensagem clara e código de saída 1.
+
+    `str(exc)` devolve a mensagem (os testes e o operador dependem disso),
+    mas o código de saída é 1 (int), e não a string.
+    """
+
+    def __init__(self, message):
+        super().__init__(1)
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+def _fail(message):
+    """Interrompe com erro operacional (código 1) e mensagem clara.
+
+    Quem imprime é a borda da CLI (`main`), para que a mensagem apareça
+    uma única vez mesmo quando o erro é tratado por um lote.
+    """
+    raise _Abort(message)
+
+
+def _resolve_base_url(flag_value):
+    """Precedência: --base-url > MAILTRACK_BASE_URL > constante."""
+    return (
+        flag_value
+        or os.getenv("MAILTRACK_BASE_URL")
+        or BASE_URL
+    ).rstrip("/")
+
+
+def _parse_timestamp(value):
+    if not value:
+        return None
+    texto = str(value).strip()
+    if texto.endswith("Z"):
+        texto = texto[:-1] + "+00:00"
+    try:
+        momento = datetime.fromisoformat(texto)
+    except ValueError:
+        return None
+    if momento.tzinfo is None:
+        momento = momento.replace(tzinfo=timezone.utc)
+    return momento
+
+
+def _age_seconds(value):
+    momento = _parse_timestamp(value)
+    if momento is None:
+        return None
+    decorrido = datetime.now(timezone.utc) - momento
+    return max(0, int(decorrido.total_seconds()))
+
+
+def _relative_age(value):
+    segundos = _age_seconds(value)
+    if segundos is None:
+        return "data desconhecida"
+    if segundos < 60:
+        return "agora"
+    if segundos < 3600:
+        minutos = segundos // 60
+        return f"há {minutos} minuto" + ("s" if minutos > 1 else "")
+    if segundos < 86400:
+        horas = segundos // 3600
+        return f"há {horas} hora" + ("s" if horas > 1 else "")
+    dias = segundos // 86400
+    return f"há {dias} dia" + ("s" if dias > 1 else "")
+
+
+def _file_size(path):
+    try:
+        return Path(path).stat().st_size
+    except OSError:
+        return None
+
+
+def resolve_message(ref=None):
+    """Resolve a mensagem alvo: ID completo ou a última criada.
+
+    Não aceita prefixo, índice nem substring: um ID desconhecido é erro.
+    """
+    with connect() as db:
+        if ref:
+            row = db.execute(
+                "SELECT id FROM messages WHERE id=?",
+                (ref,)
+            ).fetchone()
+            if row is None:
+                _fail(
+                    f"Mensagem não encontrada: {ref}. Execute "
+                    "'mailtrack list' para ver as mensagens disponíveis."
+                )
+            return row["id"]
+
+        row = db.execute(
+            "SELECT id FROM messages "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+
+    if row is None:
+        _fail(
+            "Nenhuma mensagem cadastrada. Execute "
+            "'mailtrack create --to <destinatário> --subject <assunto>' "
+            "primeiro."
+        )
+
+    return row["id"]
+
+
+def _looks_like_message_id(value):
+    return bool(re.fullmatch(r"MSG-[0-9A-F]{10}", str(value)))
+
+
+def _collect_files(args):
+    arquivos = getattr(args, "files", None)
+    if arquivos:
+        return [str(arquivo) for arquivo in arquivos]
+
+    unico = getattr(args, "file", None)
+    if unico:
+        return [str(unico)]
+
+    _fail(
+        "Nenhum arquivo informado. "
+        "Uso: mailtrack add-photo FOTO [FOTO ...]"
+    )
+
+
+def _validar_limite(limite, permitir_zero):
+    """Guarda de segurança para `--limit` fora do argparse.
+
+    O parser já valida (erro de uso, código 2); aqui evitamos que um valor
+    negativo chegue ao SQL, onde LIMIT negativo significa "sem limite", e
+    produza silenciosamente uma consulta sem restrição.
+    """
+    if limite is None:
+        return None
+    if limite < 0:
+        raise ValueError(f"limite não pode ser negativo: {limite}")
+    if limite == 0 and not permitir_zero:
+        raise ValueError("limite deve ser maior que zero")
+    return limite
+
+
 def create_message(args):
     msg_id = "MSG-" + uuid.uuid4().hex[:10].upper()
 
@@ -126,25 +278,18 @@ def create_message(args):
 
     print(f"Mensagem criada: {msg_id}")
     print(f"Destinatário: {args.to}")
+    print("Próximo passo: mailtrack add-photo fotos/*.jpg")
 
 
-def add_photo(args):
-    source = Path(args.file)
-
+def _add_one(source: Path, message_id: str):
     if not source.is_file():
-        raise SystemExit(f"Arquivo não encontrado: {source}")
+        _fail(f"Arquivo não encontrado: {source}")
 
     if source.suffix.lower() not in ALLOWED:
-        raise SystemExit("Formato de imagem não permitido.")
-
-    with connect() as db:
-        message = db.execute(
-            "SELECT id FROM messages WHERE id=?",
-            (args.message,)
-        ).fetchone()
-
-    if message is None:
-        raise SystemExit("Mensagem não encontrada.")
+        _fail(
+            f"Formato de imagem não permitido: "
+            f"{source.suffix or '(sem extensão)'}"
+        )
 
     original_token = secrets.token_urlsafe(32)
     thumbnail_token = secrets.token_urlsafe(32)
@@ -176,7 +321,7 @@ def add_photo(args):
                 _stage_thumbnail(_build_thumbnail(img), thumb_tmp)
 
         except Exception as exc:
-            raise SystemExit(
+            raise _Abort(
                 f"Imagem inválida ou não suportada: {exc}"
             ) from exc
 
@@ -196,7 +341,7 @@ def add_photo(args):
                     filename, original_path, thumbnail_path
                 ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                args.message,
+                message_id,
                 original_token,
                 thumbnail_token,
                 source.name,
@@ -225,82 +370,228 @@ def add_photo(args):
             _discard(artifacts)
         raise
 
-    print(f"Fotografia adicionada: {source.name}")
-    print(f"Miniatura: {thumb_path.name}")
+    return {
+        "original_token": original_token,
+        "thumbnail_token": thumbnail_token,
+    }
+
+
+def add_photo(args):
+    arquivos = _collect_files(args)
+
+    # Compatibilidade com a sintaxe antiga `add-photo MSG-… foto.jpg`:
+    # o primeiro argumento só é tratado como mensagem quando NÃO é um
+    # arquivo existente (evita ambiguidade com nomes de arquivo).
+    if getattr(args, "message", None) is None and len(arquivos) >= 2:
+        primeiro = arquivos[0]
+        if _looks_like_message_id(primeiro) and not Path(primeiro).is_file():
+            args.message = primeiro
+            arquivos = arquivos[1:]
+
+    message_id = resolve_message(getattr(args, "message", None))
+    base = _resolve_base_url(getattr(args, "base_url", None))
+
+    # Lote é a única situação em que uma falha não interrompe o comando:
+    # com um único arquivo o erro propaga com o tipo original, preservando
+    # o contrato do mecanismo D3 (testes T5-T7 e T16).
+    em_lote = len(arquivos) > 1
+    adicionadas = []
+    falharam = []
+
+    for nome in arquivos:
+        caminho = Path(nome)
+        try:
+            resultado = _add_one(caminho, message_id)
+        except (SystemExit, Exception) as exc:
+            if not em_lote:
+                raise
+            motivo = (
+                str(exc) if isinstance(exc, SystemExit)
+                else f"{type(exc).__name__}: {exc}"
+            )
+            falharam.append((caminho.name, motivo))
+            print(f"FALHOU  {caminho.name}: {motivo}", file=sys.stderr)
+            continue
+
+        adicionadas.append(caminho.name)
+        print(f"OK      {caminho.name}")
+        print(f"        miniatura: {base}/t/{resultado['thumbnail_token']}")
+        print(f"        original:  {base}/o/{resultado['original_token']}")
+
+    print("")
+    print(
+        f"Resumo: {len(adicionadas)} adicionada(s), "
+        f"{len(falharam)} falha(s) — mensagem {message_id}"
+    )
+
+    if em_lote:
+        for nome in adicionadas:
+            print(f"  adicionada: {nome}")
+        for nome, _motivo in falharam:
+            print(f"  falhou:     {nome}")
+
+    if falharam:
+        raise SystemExit(1)
 
 
 def list_messages(args):
+    limite = _validar_limite(getattr(args, "limit", None), permitir_zero=False)
+    como_json = getattr(args, "json", False)
+
+    sql = """
+        SELECT m.id, m.recipient, m.subject, m.created_at,
+               COUNT(p.id) AS photo_count
+        FROM messages m
+        LEFT JOIN photos p ON p.message_id = m.id
+        GROUP BY m.id
+        ORDER BY m.created_at DESC, m.rowid DESC
+    """
+    parametros = ()
+    if limite:
+        sql += " LIMIT ?"
+        parametros = (limite,)
+
     with connect() as db:
-        rows = db.execute("""
-            SELECT m.id, m.recipient, m.subject, m.created_at,
-                   COUNT(p.id) AS photo_count
-            FROM messages m
-            LEFT JOIN photos p ON p.message_id=m.id
-            GROUP BY m.id
-            ORDER BY m.created_at DESC
-        """).fetchall()
+        rows = db.execute(sql, parametros).fetchall()
+
+    ultima = rows[0]["id"] if rows else None
+
+    if como_json:
+        print(json.dumps([
+            {
+                "id": row["id"],
+                "recipient": row["recipient"],
+                "subject": row["subject"],
+                "created_at": row["created_at"],
+                "photo_count": row["photo_count"],
+                "age_seconds": _age_seconds(row["created_at"]),
+                "is_last": row["id"] == ultima,
+            }
+            for row in rows
+        ], ensure_ascii=False, indent=2))
+        return
 
     if not rows:
         print("Nenhuma mensagem cadastrada.")
+        print(
+            "Próximo passo: "
+            "mailtrack create --to <destinatário> --subject <assunto>"
+        )
         return
 
     for row in rows:
+        marcador = "*" if row["id"] == ultima else " "
         print(
-            f"{row['id']} | {row['recipient']} | "
-            f"{row['photo_count']} foto(s) | {row['subject'] or '-'}"
+            f"{marcador} {row['id']} | {row['recipient']} | "
+            f"{row['photo_count']} foto(s) | "
+            f"{_relative_age(row['created_at'])} | "
+            f"{row['subject'] or '-'}"
         )
+
+    print("")
+    print("* = última mensagem")
 
 
 def show_message(args):
+    message_id = resolve_message(getattr(args, "message", None))
+    base_url = _resolve_base_url(getattr(args, "base_url", None))
+    como_json = getattr(args, "json", False)
+
     with connect() as db:
         message = db.execute(
             "SELECT * FROM messages WHERE id=?",
-            (args.message,)
-        ).fetchone()
-
-        photos = db.execute("""
-            SELECT id, filename, created_at
-            FROM photos WHERE message_id=?
-            ORDER BY id
-        """, (args.message,)).fetchall()
-
-    if message is None:
-        raise SystemExit("Mensagem não encontrada.")
-
-    print(f"ID:           {message['id']}")
-    print(f"Destinatário: {message['recipient']}")
-    print(f"Assunto:      {message['subject'] or '-'}")
-    print(f"Criada em:    {message['created_at']}")
-    print(f"Fotografias:  {len(photos)}")
-
-    for photo in photos:
-        print(f"  [{photo['id']}] {photo['filename']}")
-
-
-def export_html(args):
-    with connect() as db:
-        message = db.execute(
-            "SELECT * FROM messages WHERE id=?",
-            (args.message,)
+            (message_id,)
         ).fetchone()
 
         photos = db.execute("""
             SELECT * FROM photos
             WHERE message_id=?
             ORDER BY id
-        """, (args.message,)).fetchall()
+        """, (message_id,)).fetchall()
 
     if message is None:
-        raise SystemExit("Mensagem não encontrada.")
+        _fail(
+            f"Mensagem não encontrada: {message_id}. "
+            "Execute 'mailtrack list' para ver as mensagens disponíveis."
+        )
+
+    fotos = [
+        {
+            "id": photo["id"],
+            "filename": photo["filename"],
+            "created_at": photo["created_at"],
+            "size_bytes": _file_size(photo["original_path"]),
+            "thumbnail_url": f"{base_url}/t/{photo['thumbnail_token']}",
+            "original_url": f"{base_url}/o/{photo['original_token']}",
+        }
+        for photo in photos
+    ]
+
+    if como_json:
+        print(json.dumps({
+            "id": message["id"],
+            "recipient": message["recipient"],
+            "subject": message["subject"],
+            "created_at": message["created_at"],
+            "age_seconds": _age_seconds(message["created_at"]),
+            "photos": fotos,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    print(f"ID:           {message['id']}")
+    print(f"Destinatário: {message['recipient']}")
+    print(f"Assunto:      {message['subject'] or '-'}")
+    print(
+        f"Criada em:    {message['created_at']} "
+        f"({_relative_age(message['created_at'])})"
+    )
+    print(f"Fotografias:  {len(fotos)}")
+
+    for foto in fotos:
+        tamanho = (
+            f"{foto['size_bytes']} bytes"
+            if foto["size_bytes"] is not None
+            else "indisponível"
+        )
+        print(f"  [{foto['id']}] {foto['filename']}")
+        print(f"      data: {foto['created_at']} | tamanho: {tamanho}")
+        print(f"      miniatura: {foto['thumbnail_url']}")
+        print(f"      original:  {foto['original_url']}")
+
+
+def export_html(args):
+    message_id = resolve_message(getattr(args, "message", None))
+    base_url = _resolve_base_url(getattr(args, "base_url", None))
+
+    with connect() as db:
+        message = db.execute(
+            "SELECT * FROM messages WHERE id=?",
+            (message_id,)
+        ).fetchone()
+
+        photos = db.execute("""
+            SELECT * FROM photos
+            WHERE message_id=?
+            ORDER BY id
+        """, (message_id,)).fetchall()
+
+    if message is None:
+        _fail(
+            f"Mensagem não encontrada: {message_id}. "
+            "Execute 'mailtrack list' para ver as mensagens disponíveis."
+        )
 
     if not photos:
-        raise SystemExit("A mensagem ainda não possui fotografias.")
+        _fail(
+            f"A mensagem {message_id} ainda não possui fotografias. "
+            "Execute 'mailtrack add-photo <arquivos>' primeiro."
+        )
 
     blocks = []
 
     for photo in photos:
-        thumb = f"{args.base_url.rstrip('/')}/t/{photo['thumbnail_token']}"
-        original = f"{args.base_url.rstrip('/')}/o/{photo['original_token']}"
+        thumb = f"{base_url}/t/{photo['thumbnail_token']}"
+        original = f"{base_url}/o/{photo['original_token']}"
 
         blocks.append(f"""
         <p>
@@ -329,36 +620,60 @@ def export_html(args):
 </html>
 """
 
-    EXPORTS.mkdir(parents=True, exist_ok=True)
-    output = EXPORTS / f"{args.message}.html"
-    tmp = EXPORTS / f".{output.name}.{secrets.token_hex(16)}.tmp"
+    destino = getattr(args, "output", None)
+    if destino:
+        output = Path(destino).expanduser()
+        output.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        EXPORTS.mkdir(parents=True, exist_ok=True)
+        output = EXPORTS / f"{message_id}.html"
+
+    tmp = output.parent / f".{output.name}.{secrets.token_hex(16)}.tmp"
 
     try:
         _stage_html(html, tmp)
         os.replace(tmp, output)
-        _fsync_dir(EXPORTS)
+        _fsync_dir(output.parent)
     except BaseException:
         # Apenas o temporário é removido: o destino pode conter a
         # exportação anterior e nunca é apagado por causa de uma falha.
         _discard([tmp])
         raise
 
-    print(f"HTML gerado: {output}")
+    print(f"HTML gerado: {output.resolve()}")
+    print(
+        "Próximo passo: revise o arquivo e use o conteúdo no e-mail "
+        "(as imagens são servidas pelas URLs públicas)."
+    )
 
 
 def history(args):
+    message_id = resolve_message(getattr(args, "message", None))
+    limite = _validar_limite(getattr(args, "limit", 20), permitir_zero=True)
+    resumo = getattr(args, "summary", False)
+
+    sql = """
+        SELECT e.*, p.filename
+        FROM events e
+        LEFT JOIN photos p ON p.id = e.photo_id
+        WHERE e.message_id = ?
+    """
+    parametros = [message_id]
+    if limite:
+        sql += " ORDER BY e.occurred_at DESC, e.id DESC LIMIT ?"
+        parametros.append(limite)
+    else:
+        sql += " ORDER BY e.occurred_at, e.id"
+
     with connect() as db:
-        rows = db.execute("""
-            SELECT e.*, p.filename
-            FROM events e
-            LEFT JOIN photos p ON p.id=e.photo_id
-            WHERE e.message_id=?
-            ORDER BY e.occurred_at, e.id
-        """, (args.message,)).fetchall()
+        rows = db.execute(sql, tuple(parametros)).fetchall()
 
     if not rows:
         print("Nenhum evento registrado.")
         return
+
+    if limite:
+        rows = list(reversed(rows))
 
     for row in rows:
         print(
@@ -366,6 +681,9 @@ def history(args):
             f"{row['event_type']} | "
             f"{row['filename'] or '-'}"
         )
+
+        if resumo:
+            continue
 
         print(f"  IP visitante (Cloudflare): {row['remote_ip'] or '-'}")
         print(f"  IP da conexão:             {row['client_ip'] or '-'}")
@@ -376,38 +694,196 @@ def history(args):
         print(f"  User-Agent:                {row['user_agent'] or '-'}")
 
 
-def main():
-    parser = argparse.ArgumentParser(prog="mailtrack")
-    commands = parser.add_subparsers(dest="command", required=True)
+def _positive_int(value):
+    """Tipo do argparse para `list --limit`: inteiro maior que zero."""
+    try:
+        numero = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"valor inteiro esperado, recebido: {value!r}"
+        ) from None
+    if numero <= 0:
+        raise argparse.ArgumentTypeError(
+            f"o limite deve ser um inteiro maior que zero (recebido: {numero})"
+        )
+    return numero
 
-    p = commands.add_parser("create")
-    p.add_argument("--to", required=True)
-    p.add_argument("--subject", default="")
+
+def _non_negative_int(value):
+    """Tipo do argparse para `history --limit`: inteiro maior ou igual a zero."""
+    try:
+        numero = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"valor inteiro esperado, recebido: {value!r}"
+        ) from None
+    if numero < 0:
+        raise argparse.ArgumentTypeError(
+            f"o limite não pode ser negativo (recebido: {numero}); "
+            "use 0 para todos os eventos"
+        )
+    return numero
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mailtrack",
+        description=(
+            "Gerencia mensagens com fotografias rastreadas "
+            "(miniaturas, HTML e histórico de acessos)."
+        ),
+        epilog=(
+            "Exemplos:\n"
+            "  mailtrack create --to destinatario@exemplo.com "
+            "--subject \"Fotos\"\n"
+            "  mailtrack add-photo fotos/*.jpg\n"
+            "  mailtrack export-html\n"
+            "  mailtrack list\n"
+            "  mailtrack show\n"
+            "  mailtrack history --limit 5 --summary\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"mailtrack {VERSION}",
+    )
+
+    commands = parser.add_subparsers(
+        dest="command", required=True, metavar="COMANDO"
+    )
+
+    p = commands.add_parser(
+        "create",
+        help="cria uma mensagem",
+        description="Cria uma mensagem para o destinatário informado.",
+        epilog=(
+            "Exemplo:\n"
+            "  mailtrack create --to destinatario@exemplo.com "
+            "--subject \"Fotos\"\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--to", required=True, metavar="EMAIL")
+    p.add_argument("--subject", default="", metavar="TEXTO")
     p.set_defaults(func=create_message)
 
-    p = commands.add_parser("add-photo")
-    p.add_argument("message")
-    p.add_argument("file")
+    p = commands.add_parser(
+        "add-photo",
+        help="adiciona uma ou mais fotografias",
+        description=(
+            "Adiciona fotografias à mensagem. Sem --message, usa a "
+            "última mensagem criada."
+        ),
+        epilog=(
+            "Exemplos:\n"
+            "  mailtrack add-photo fotos/*.jpg\n"
+            "  mailtrack add-photo -m MSG-AB12CD34EF foto1.jpg foto2.jpg\n"
+            "  mailtrack add-photo MSG-AB12CD34EF foto.jpg   # forma antiga\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("files", nargs="+", metavar="FOTO")
+    p.add_argument("-m", "--message", default=None, metavar="MSG")
+    p.add_argument("--base-url", default=None, metavar="URL")
     p.set_defaults(func=add_photo)
 
-    p = commands.add_parser("list")
+    p = commands.add_parser(
+        "list",
+        help="lista as mensagens",
+        description="Lista as mensagens, marcando a última com '*'.",
+        epilog="Exemplos:\n  mailtrack list\n  mailtrack list --limit 5\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("-n", "--limit", type=_positive_int, default=None,
+                   metavar="N")
+    p.add_argument("--json", action="store_true", help="saída em JSON")
     p.set_defaults(func=list_messages)
 
-    p = commands.add_parser("show")
-    p.add_argument("message")
+    p = commands.add_parser(
+        "show",
+        help="mostra uma mensagem e suas fotografias",
+        description=(
+            "Mostra os dados da mensagem e, por fotografia, data, "
+            "tamanho e URLs públicas. Sem MSG, usa a última mensagem."
+        ),
+        epilog="Exemplo:\n  mailtrack show\n  mailtrack show MSG-AB12CD34EF\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("message", nargs="?", default=None, metavar="MSG")
+    p.add_argument("--json", action="store_true", help="saída em JSON")
+    p.add_argument("--base-url", default=None, metavar="URL")
     p.set_defaults(func=show_message)
 
-    p = commands.add_parser("export-html")
-    p.add_argument("message")
-    p.add_argument("--base-url", default=BASE_URL)
+    p = commands.add_parser(
+        "export-html",
+        help="gera o HTML da mensagem",
+        description=(
+            "Gera o HTML da mensagem. Sem MSG, usa a última mensagem. "
+            "Base URL: --base-url > MAILTRACK_BASE_URL > padrão."
+        ),
+        epilog=(
+            "Exemplos:\n"
+            "  mailtrack export-html\n"
+            "  mailtrack export-html MSG-AB12CD34EF\n"
+            "  mailtrack export-html -o ~/fotos.html\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("message", nargs="?", default=None, metavar="MSG")
+    p.add_argument("--base-url", default=None, metavar="URL")
+    p.add_argument("-o", "--output", default=None, metavar="ARQUIVO")
     p.set_defaults(func=export_html)
 
-    p = commands.add_parser("history")
-    p.add_argument("message")
+    p = commands.add_parser(
+        "history",
+        help="mostra os eventos de acesso",
+        description=(
+            "Mostra os eventos de acesso da mensagem (padrão: os 20 "
+            "mais recentes). Sem MSG, usa a última mensagem."
+        ),
+        epilog=(
+            "Exemplos:\n"
+            "  mailtrack history\n"
+            "  mailtrack history --limit 5 --summary\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("message", nargs="?", default=None, metavar="MSG")
+    p.add_argument("-n", "--limit", type=_non_negative_int, default=20,
+                   metavar="N")
+    p.add_argument(
+        "--summary",
+        action="store_true",
+        help="uma linha compacta por evento",
+    )
     p.set_defaults(func=history)
 
     args = parser.parse_args()
-    args.func(args)
+
+    try:
+        args.func(args)
+    except _Abort as exc:
+        # Mensagem de erro operacional: uma única vez, no stderr, com
+        # código de saída 1 (os erros de uso já saem com 2 pelo argparse).
+        print(exc, file=sys.stderr)
+        raise SystemExit(1) from None
+    except (OSError, sqlite3.Error) as exc:
+        # Erros operacionais de I/O e de banco: mensagem clara no stderr,
+        # código de saída 1, sem traceback. Exceções inesperadas de
+        # programação continuam propagando (com traceback) para não
+        # esconder defeitos do código.
+        print(
+            f"Erro operacional ({type(exc).__name__}): {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Verifique permissões de arquivo, espaço em disco e a "
+            "disponibilidade do banco de dados.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
