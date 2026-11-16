@@ -1,7 +1,9 @@
 import argparse
+import os
 import secrets
 import shutil
 import sqlite3
+import sys
 import uuid
 from pathlib import Path
 from html import escape
@@ -23,6 +25,65 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     return db
+
+
+def _fsync_dir(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _stage_thumbnail(img, destination: Path) -> None:
+    with open(destination, "xb") as out:
+        img.save(out, "JPEG", quality=82, optimize=True)
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def _stage_original(source: Path, destination: Path) -> None:
+    with open(destination, "xb") as out, source.open("rb") as inp:
+        shutil.copyfileobj(inp, out, 1024 * 1024)
+        out.flush()
+        shutil.copystat(source, destination)
+        os.fsync(out.fileno())
+
+
+def _stage_html(content: str, destination: Path) -> None:
+    with open(destination, "xb") as out:
+        out.write(content.encode("utf-8"))
+        out.flush()
+        os.fsync(out.fileno())
+
+
+def _photo_exists(original_token: str, thumbnail_token: str) -> bool:
+    try:
+        db = connect()
+        try:
+            row = db.execute(
+                "SELECT 1 FROM photos "
+                "WHERE original_token=? OR thumbnail_token=?",
+                (original_token, thumbnail_token)
+            ).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return True
+
+    return row is not None
+
+
+def _discard(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(
+                f"Aviso: não foi possível remover {path}: {exc}",
+                file=sys.stderr
+            )
 
 
 def create_message(args):
@@ -59,31 +120,53 @@ def add_photo(args):
     original_token = secrets.token_urlsafe(32)
     thumbnail_token = secrets.token_urlsafe(32)
 
-    try:
-        with Image.open(source) as img:
-            img.verify()
-
-        with Image.open(source) as img:
-            img = ImageOps.exif_transpose(img)
-            img.thumbnail((480, 480))
-
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-
-            thumb_name = thumbnail_token + ".jpg"
-            thumb_path = THUMBS / thumb_name
-            img.save(thumb_path, "JPEG", quality=82, optimize=True)
-
-    except Exception as exc:
-        raise SystemExit(f"Imagem inválida ou não suportada: {exc}")
-
     original_name = original_token + source.suffix.lower()
     original_path = PHOTOS / original_name
+    thumb_name = thumbnail_token + ".jpg"
+    thumb_path = THUMBS / thumb_name
 
-    shutil.copy2(source, original_path)
+    # Os temporários ficam no mesmo diretório do destino: os.replace()
+    # só é atômico dentro do mesmo sistema de arquivos.
+    original_tmp = PHOTOS / f".{original_name}.{secrets.token_hex(16)}.tmp"
+    thumb_tmp = THUMBS / f".{thumb_name}.{secrets.token_hex(16)}.tmp"
+
+    # Os destinos entram na lista de limpeza ANTES do os.replace(): uma
+    # interrupção logo após o rename não deixa arquivo órfão. Nomes usam
+    # tokens novos (128 bits), então não há arquivo alheio nesses caminhos.
+    artifacts = [thumb_tmp, thumb_path, original_tmp, original_path]
+
+    committed = False
+    db_write_started = False
 
     try:
-        with connect() as db:
+        try:
+            with Image.open(source) as img:
+                img.verify()
+
+            with Image.open(source) as img:
+                img = ImageOps.exif_transpose(img)
+                img.thumbnail((480, 480))
+
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+
+                _stage_thumbnail(img, thumb_tmp)
+
+        except Exception as exc:
+            raise SystemExit(
+                f"Imagem inválida ou não suportada: {exc}"
+            ) from exc
+
+        os.replace(thumb_tmp, thumb_path)
+        _fsync_dir(THUMBS)
+
+        _stage_original(source, original_tmp)
+        os.replace(original_tmp, original_path)
+        _fsync_dir(PHOTOS)
+
+        db = connect()
+        db_write_started = True
+        try:
             db.execute("""
                 INSERT INTO photos (
                     message_id, original_token, thumbnail_token,
@@ -97,9 +180,26 @@ def add_photo(args):
                 str(original_path),
                 str(thumb_path)
             ))
-    except Exception:
-        original_path.unlink(missing_ok=True)
-        thumb_path.unlink(missing_ok=True)
+            db.commit()
+            committed = True
+        finally:
+            db.close()
+
+    except BaseException:
+        # close() já desfez a transação quando o commit não ocorreu. Se o
+        # commit foi confirmado (inclusive quando a interrupção chega logo
+        # depois dele), apagar os arquivos deixaria uma linha apontando
+        # para arquivo inexistente: nesse caso eles são preservados.
+        #
+        # Antes da etapa de banco não existe linha que justifique manter
+        # os arquivos: apagar direto evita temporários abandonados quando
+        # o SQLite está indisponível (_photo_exists responderia True).
+        if not db_write_started:
+            _discard(artifacts)
+        elif not committed and not _photo_exists(
+            original_token, thumbnail_token
+        ):
+            _discard(artifacts)
         raise
 
     print(f"Fotografia adicionada: {source.name}")
@@ -206,7 +306,17 @@ def export_html(args):
 
     EXPORTS.mkdir(parents=True, exist_ok=True)
     output = EXPORTS / f"{args.message}.html"
-    output.write_text(html, encoding="utf-8")
+    tmp = EXPORTS / f".{output.name}.{secrets.token_hex(16)}.tmp"
+
+    try:
+        _stage_html(html, tmp)
+        os.replace(tmp, output)
+        _fsync_dir(EXPORTS)
+    except BaseException:
+        # Apenas o temporário é removido: o destino pode conter a
+        # exportação anterior e nunca é apagado por causa de uma falha.
+        _discard([tmp])
+        raise
 
     print(f"HTML gerado: {output}")
 
