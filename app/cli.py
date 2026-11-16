@@ -19,6 +19,10 @@ EXPORTS = Path("/data/exports")
 BASE_URL = "https://photos.datalog.top"
 ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".tif", ".tiff", ".bmp"}
 
+# Miniatura: arquivo 240x240 (quadrado, corte central) exibido em 120x120 no HTML.
+THUMB_PX = 240
+THUMB_DISPLAY_PX = 120
+
 
 def connect():
     db = sqlite3.connect(DB)
@@ -34,6 +38,31 @@ def _fsync_dir(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _build_thumbnail(img):
+    img = ImageOps.exif_transpose(img)
+
+    # Transparência (PNG/WebP/GIF com alfa) é composta sobre fundo BRANCO:
+    # converter RGBA->RGB diretamente descartaria o alfa e deixaria a área
+    # transparente escura no JPEG.
+    if img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info:
+        rgba = img.convert("RGBA")
+        fundo = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        fundo.alpha_composite(rgba)
+        img = fundo
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # Quadrado por corte central, sem distorção; imagens menores são
+    # ampliadas para cumprir o tamanho físico de 240x240.
+    return ImageOps.fit(
+        img,
+        (THUMB_PX, THUMB_PX),
+        method=Image.LANCZOS,
+        centering=(0.5, 0.5)
+    )
 
 
 def _stage_thumbnail(img, destination: Path) -> None:
@@ -144,13 +173,7 @@ def add_photo(args):
                 img.verify()
 
             with Image.open(source) as img:
-                img = ImageOps.exif_transpose(img)
-                img.thumbnail((480, 480))
-
-                if img.mode not in ("RGB", "L"):
-                    img = img.convert("RGB")
-
-                _stage_thumbnail(img, thumb_tmp)
+                _stage_thumbnail(_build_thumbnail(img), thumb_tmp)
 
         except Exception as exc:
             raise SystemExit(
@@ -284,7 +307,9 @@ def export_html(args):
           <a href="{escape(original, quote=True)}">
             <img src="{escape(thumb, quote=True)}"
                  alt="{escape(photo['filename'], quote=True)}"
-                 style="max-width:120px;height:auto">
+                 width="{THUMB_DISPLAY_PX}" height="{THUMB_DISPLAY_PX}"
+                 loading="lazy"
+                 style="width:{THUMB_DISPLAY_PX}px;height:{THUMB_DISPLAY_PX}px;object-fit:cover">
           </a>
         </p>
         """)

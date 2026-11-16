@@ -134,6 +134,17 @@ class CliTestCase(unittest.TestCase):
             base_url=base_url
         )
 
+    def _write_image(self, name, size, mode="RGB", color=(10, 20, 30)):
+        path = self.base / "in" / name
+        Image.new(mode, size, color).save(path)
+        return path
+
+    def _photo_row(self):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM photos ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+
     def _add_photo_rows(
         self, rows=(("ORIG1", "THUMB1"), ("ORIG2", "THUMB2"))
     ):
@@ -202,7 +213,7 @@ class CliTestCase(unittest.TestCase):
 
 
 class AddPhotoTest(CliTestCase):
-    """T1-T14: publicacao de miniaturas e originais."""
+    """T1-T16, T21-T26: publicacao de miniaturas e originais."""
 
     def test_t1_add_photo_publica_original_e_miniatura(self):
         cli.add_photo(self._photo_args())
@@ -226,7 +237,7 @@ class AddPhotoTest(CliTestCase):
         )
         with Image.open(thumb) as image:
             self.assertEqual(image.format, "JPEG")
-            self.assertLessEqual(max(image.size), 480)
+            self.assertEqual(image.size, (240, 240))
 
     def test_t2_nao_deixa_temporarios_apos_sucesso(self):
         cli.add_photo(self._photo_args())
@@ -549,9 +560,103 @@ class AddPhotoTest(CliTestCase):
         self.assertEqual(self._names(self.thumbs), [])
         self.assertEqual(self._photo_count(), 0)
 
+    def test_t22_miniatura_240_quadrada_paisagem(self):
+        origem = self._write_image(
+            "paisagem.jpg", (1200, 800), "RGB", (20, 40, 60)
+        )
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            self.assertEqual(imagem.format, "JPEG")
+            self.assertEqual(imagem.size, (240, 240))
+
+    def test_t23_miniatura_240_quadrada_retrato(self):
+        origem = self._write_image(
+            "retrato.jpg", (800, 1200), "RGB", (60, 40, 20)
+        )
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            self.assertEqual(imagem.size, (240, 240))
+
+    def test_t24_miniatura_faz_corte_central(self):
+        faixas = Image.new("RGB", (720, 240), (255, 0, 0))
+        faixas.paste((0, 255, 0), (240, 0, 480, 240))
+        faixas.paste((0, 0, 255), (480, 0, 720, 240))
+        origem = self.base / "in" / "faixas.png"
+        faixas.save(origem)
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            self.assertEqual(imagem.size, (240, 240))
+            convertida = imagem.convert("RGB")
+            for ponto in ((2, 2), (120, 120), (237, 237)):
+                r, g, b = convertida.getpixel(ponto)
+                self.assertGreater(g, 200)
+                self.assertLess(r, 60)
+                self.assertLess(b, 60)
+
+    def test_t25_transparencia_composta_sobre_branco(self):
+        transposta = Image.new("RGBA", (600, 600), (0, 0, 0, 0))
+        transposta.paste((255, 0, 0, 255), (200, 200, 400, 400))
+        origem = self.base / "in" / "transparente.png"
+        transposta.save(origem)
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            convertida = imagem.convert("RGB")
+            self.assertEqual(convertida.size, (240, 240))
+            for canto in ((2, 2), (237, 2), (2, 237), (237, 237)):
+                r, g, b = convertida.getpixel(canto)
+                self.assertGreaterEqual(min(r, g, b), 245)
+            r, g, b = convertida.getpixel((120, 120))
+            self.assertGreater(r, 200)
+            self.assertLess(g, 60)
+            self.assertLess(b, 60)
+
+    def test_t26_miniatura_amplia_imagem_pequena(self):
+        origem = self._write_image(
+            "icone.png", (100, 100), "RGB", (30, 120, 200)
+        )
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            self.assertEqual(imagem.size, (240, 240))
+
+    def test_t28_png_paleta_com_transparencia_por_indice(self):
+        paleta = [0, 0, 0, 255, 0, 0] + [0, 0, 0] * 254
+        paletizada = Image.new("P", (600, 600), 0)
+        paletizada.putpalette(paleta)
+        paletizada.paste(1, (200, 200, 400, 400))
+        paletizada.info["transparency"] = 0
+        origem = self.base / "in" / "paleta.png"
+        paletizada.save(origem, "PNG")
+
+        with Image.open(origem) as conferida:
+            self.assertEqual(conferida.mode, "P")
+            self.assertEqual(conferida.info.get("transparency"), 0)
+
+        cli.add_photo(self._photo_args(origem))
+
+        with Image.open(self._photo_row()["thumbnail_path"]) as imagem:
+            convertida = imagem.convert("RGB")
+            self.assertEqual(convertida.size, (240, 240))
+            for canto in ((2, 2), (237, 2), (2, 237), (237, 237)):
+                r, g, b = convertida.getpixel(canto)
+                self.assertGreaterEqual(min(r, g, b), 245)
+            r, g, b = convertida.getpixel((120, 120))
+            self.assertGreater(r, 200)
+            self.assertLess(g, 60)
+            self.assertLess(b, 60)
+
 
 class ExportHtmlTest(CliTestCase):
-    """T17-T20: publicacao atomica do HTML."""
+    """T17-T20 e T27: publicacao atomica do HTML."""
 
     def test_t17_export_html_publica_conteudo_correto(self):
         self._add_photo_rows()
@@ -567,6 +672,9 @@ class ExportHtmlTest(CliTestCase):
         self.assertIn("https://photos.example/o/ORIG2", conteudo)
         self.assertIn("Fotos &amp; Cia", conteudo)
         self.assertIn("ORIG1.jpg", conteudo)
+        self.assertIn('width="120" height="120"', conteudo)
+        self.assertIn("object-fit:cover", conteudo)
+        self.assertIn('loading="lazy"', conteudo)
         self.assertEqual(self._names(self.exports), [destino.name])
         self.assertEqual(self._temps(self.exports), [])
 
@@ -683,6 +791,38 @@ class ExportHtmlTest(CliTestCase):
             self.assertEqual(
                 destino.read_text(encoding="utf-8"), "CONTEUDO ANTERIOR"
             )
+
+    def test_t27_html_compativel_com_miniatura_legada(self):
+        legado = self.thumbs / "LEGADA.jpg"
+        Image.new("RGB", (480, 360), (200, 10, 10)).save(legado, "JPEG")
+        conteudo_antes = legado.read_bytes()
+        mtime_antes = legado.stat().st_mtime_ns
+
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO photos (message_id, original_token, "
+                "thumbnail_token, filename, original_path, thumbnail_path) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    self.message_id,
+                    "ORIGLEG",
+                    "THUMBLEG",
+                    "legada.jpg",
+                    "/data/photos/ORIGLEG.jpg",
+                    str(legado),
+                )
+            )
+
+        cli.export_html(self._export_args())
+        html = (self.exports / f"{self.message_id}.html").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('width="120" height="120"', html)
+        self.assertIn("object-fit:cover", html)
+        self.assertIn("https://photos.example/t/THUMBLEG", html)
+        self.assertEqual(legado.read_bytes(), conteudo_antes)
+        self.assertEqual(legado.stat().st_mtime_ns, mtime_antes)
 
 
 if __name__ == "__main__":
