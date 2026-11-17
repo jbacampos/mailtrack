@@ -267,18 +267,24 @@ def _validar_limite(limite, permitir_zero):
     return limite
 
 
-def create_message(args):
+def _create_message(recipient, subject):
     msg_id = "MSG-" + uuid.uuid4().hex[:10].upper()
 
     with connect() as db:
         db.execute(
             "INSERT INTO messages (id, recipient, subject) VALUES (?, ?, ?)",
-            (msg_id, args.to, args.subject)
+            (msg_id, recipient, subject)
         )
 
+    return msg_id
+
+
+def create_message(args):
+    msg_id = _create_message(args.to, args.subject)
     print(f"Mensagem criada: {msg_id}")
     print(f"Destinatário: {args.to}")
     print("Próximo passo: mailtrack add-photo fotos/*.jpg")
+    return msg_id
 
 
 def _add_one(source: Path, message_id: str):
@@ -647,6 +653,253 @@ def export_html(args):
     )
 
 
+def _is_single_email(value):
+    if not value or value.count("@") != 1:
+        return False
+    local, dominio = value.split("@")
+    if not local or not dominio:
+        return False
+    if any(char.isspace() for char in value):
+        return False
+    return "," not in value and ";" not in value
+
+
+def _ask_input(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        _fail(
+            "Entrada encerrada; operação cancelada. "
+            "Nenhuma mensagem foi criada."
+        )
+
+
+def _ask_recipient():
+    while True:
+        valor = _ask_input("Destinatário: ").strip()
+        if _is_single_email(valor):
+            return valor
+        if not valor:
+            print("Informe um destinatário.")
+        else:
+            print(
+                "E-mail inválido. Informe um único endereço de e-mail."
+            )
+
+
+def _ask_subject():
+    return _ask_input("Assunto: ").strip()
+
+
+def _photo_problem(caminho):
+    if not caminho.is_file():
+        return f"Arquivo não encontrado: {caminho}"
+    if caminho.suffix.lower() not in ALLOWED:
+        return (
+            "Formato de imagem não permitido: "
+            f"{caminho.suffix or '(sem extensão)'}"
+        )
+    try:
+        with Image.open(caminho) as img:
+            img.verify()
+    except Exception as exc:
+        return f"Imagem inválida ou não suportada: {exc}"
+    return None
+
+
+def _ask_photos():
+    fotos = []
+    while True:
+        valor = _ask_input(
+            "Fotografia (Enter para encerrar): "
+        ).strip()
+        if not valor:
+            break
+        caminho = Path(valor).expanduser()
+        problema = _photo_problem(caminho)
+        if problema:
+            print(problema)
+            continue
+        fotos.append(str(caminho))
+    return fotos
+
+
+def _print_new_summary(recipient, subject, photos):
+    print("")
+    print("Resumo:")
+    print(f"  Destinatário: {recipient}")
+    print(f"  Assunto: {subject or '(sem assunto)'}")
+    print(f"  Fotografias: {len(photos)}")
+    for indice, caminho in enumerate(photos, 1):
+        print(f"    {indice}. {Path(caminho).name}")
+    print("")
+
+
+def _confirm_new():
+    resposta = _ask_input(
+        "Confirma a criação da mensagem e a geração do HTML? [s/N] "
+    ).strip().lower()
+    return resposta in {"s", "sim"}
+
+
+def _photo_count(message_id):
+    try:
+        with connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS total FROM photos WHERE message_id=?",
+                (message_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row["total"]
+
+
+def _photo_count_label(total):
+    if total is None:
+        return "quantidade de fotografias desconhecida"
+    return "1 fotografia" if total == 1 else f"{total} fotografias"
+
+
+def _photo_progress(total, expected):
+    if total is None:
+        return "quantidade de fotografias desconhecida"
+    return f"{total} de {expected} fotografia(s)"
+
+
+def _failure_detail(exc):
+    if isinstance(exc, (_Abort, OSError, sqlite3.Error)):
+        return str(exc).strip()
+    return ""
+
+
+def _discard_empty_message(message_id):
+    """Remove apenas uma mensagem sem fotos e sem eventos associados."""
+    try:
+        with connect() as db:
+            cursor = db.execute(
+                "DELETE FROM messages WHERE id=? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM photos WHERE message_id=?"
+                ") AND NOT EXISTS ("
+                "SELECT 1 FROM events WHERE message_id=?"
+                ")",
+                (message_id, message_id, message_id),
+            )
+            return cursor.rowcount > 0
+    except sqlite3.Error:
+        return False
+
+
+def _run_new(state):
+    recipient = _ask_recipient()
+    subject = _ask_subject()
+    photos = _ask_photos()
+
+    if not photos:
+        _fail(
+            "Nenhuma fotografia selecionada. Nenhuma mensagem foi criada."
+        )
+
+    _print_new_summary(recipient, subject, photos)
+    if not _confirm_new():
+        print("Operação cancelada. Nenhuma mensagem foi criada.")
+        return
+
+    message_id = _create_message(recipient, subject)
+    state["message_id"] = message_id
+    print(f"Mensagem criada: {message_id}")
+    print(f"Adicionando {len(photos)} fotografia(s)...")
+
+    try:
+        add_photo(argparse.Namespace(
+            files=photos, message=message_id, base_url=None
+        ))
+    except (SystemExit, OSError, sqlite3.Error) as exc:
+        if isinstance(exc, SystemExit) and exc.code in (None, 0):
+            raise
+        total = _photo_count(message_id)
+        detalhe = _failure_detail(exc)
+        if total == 0:
+            if _discard_empty_message(message_id):
+                _fail(
+                    "Nenhuma fotografia foi adicionada. A mensagem "
+                    "recém-criada foi descartada e o HTML não foi gerado."
+                    + (f" Motivo: {detalhe}" if detalhe else "")
+                )
+            _fail(
+                f"Mensagem {message_id} criada sem fotografia. "
+                "O HTML não foi gerado. Corrija as falhas acima, complemente "
+                f"as fotografias com "
+                f"'mailtrack add-photo {message_id} FOTO...' e execute "
+                f"'mailtrack export-html {message_id}'."
+                + (f" Motivo: {detalhe}" if detalhe else "")
+            )
+        _fail(
+            f"Mensagem {message_id} criada com "
+            f"{_photo_progress(total, len(photos))}. O HTML não foi gerado. "
+            "Corrija as falhas acima, complete as fotografias com "
+            f"'mailtrack add-photo {message_id} FOTO...' e execute "
+            f"'mailtrack export-html {message_id}'."
+            + (f" Motivo: {detalhe}" if detalhe else "")
+        )
+
+    try:
+        export_html(argparse.Namespace(
+            message=message_id, base_url=None, output=None
+        ))
+    except (SystemExit, OSError, sqlite3.Error) as exc:
+        if isinstance(exc, SystemExit) and exc.code in (None, 0):
+            raise
+        total = _photo_count(message_id)
+        detalhe = _failure_detail(exc)
+        _fail(
+            f"Mensagem {message_id} criada com "
+            f"{_photo_count_label(total)}, mas o HTML não foi gerado."
+            + (f" Motivo: {detalhe}" if detalhe else "")
+            + f" Execute 'mailtrack export-html {message_id}' "
+            "para tentar novamente."
+        )
+
+    destino = (EXPORTS / f"{message_id}.html").resolve()
+    print("")
+    print("Mensagem pronta para uso:")
+    print(f"  1. Abra {destino} no navegador.")
+    print("  2. Copie o conteúdo renderizado e cole no corpo do e-mail")
+    print("     no Gmail, Outlook ou outro provedor.")
+    print(f"  3. Envie para {recipient}. O MailTrack não envia o e-mail.")
+
+
+def new_message(args):
+    state = {"message_id": None}
+    try:
+        _run_new(state)
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+        message_id = state["message_id"]
+        if message_id is None:
+            print(
+                "Operação cancelada. Nenhuma mensagem foi criada.",
+                file=sys.stderr,
+            )
+        elif _discard_empty_message(message_id):
+            print(
+                "Operação cancelada. A mensagem recém-criada foi "
+                "descartada porque nenhuma fotografia foi adicionada.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Operação interrompida. A mensagem {message_id} pode "
+                "estar incompleta; o HTML não foi gerado. Para retomar, "
+                f"verifique as fotografias com 'mailtrack show {message_id}', "
+                f"complete com 'mailtrack add-photo {message_id} FOTO...' "
+                "se necessário e execute "
+                f"'mailtrack export-html {message_id}'.",
+                file=sys.stderr,
+            )
+        raise SystemExit(130)
+
+
 # Rótulos curtos para os tipos de evento registrados pela aplicação.
 _EVENT_LABELS = {
     "thumbnail_requested": "Miniatura",
@@ -793,7 +1046,41 @@ def _non_negative_int(value):
     return numero
 
 
+def _print_short_help():
+    print("MAILTRACK — fotografias com histórico de acessos")
+    print("")
+    print("Uso:")
+    print(
+        "  mailtrack new                 "
+        "assistente interativo (recomendado)"
+    )
+    print("  mailtrack list                lista as mensagens")
+    print(
+        "  mailtrack show [MSG]          "
+        "mostra uma mensagem e suas fotografias"
+    )
+    print(
+        "  mailtrack history [MSG]       "
+        "mostra o histórico de acessos"
+    )
+    print("")
+    print("Comandos manuais:")
+    print("  mailtrack create --to EMAIL --subject TEXTO")
+    print("  mailtrack add-photo FOTO [FOTO ...]")
+    print("  mailtrack export-html [MSG] [-o ARQUIVO]")
+    print("")
+    print("Início rápido:")
+    print("  mailtrack new")
+    print("")
+    print("Ajuda completa:")
+    print("  mailtrack --help")
+
+
 def main():
+    if not sys.argv[1:]:
+        _print_short_help()
+        return
+
     parser = argparse.ArgumentParser(
         prog="mailtrack",
         description=(
@@ -802,6 +1089,7 @@ def main():
         ),
         epilog=(
             "Exemplos:\n"
+            "  mailtrack new\n"
             "  mailtrack create --to destinatario@exemplo.com "
             "--subject \"Fotos\"\n"
             "  mailtrack add-photo fotos/*.jpg\n"
@@ -821,6 +1109,19 @@ def main():
     commands = parser.add_subparsers(
         dest="command", required=True, metavar="COMANDO"
     )
+
+    p = commands.add_parser(
+        "new",
+        help="assistente para criar mensagem, fotos e HTML",
+        description=(
+            "Assistente interativo: pergunta destinatário, assunto e "
+            "fotografias, apresenta um resumo, cria a mensagem, adiciona "
+            "as fotografias e gera o HTML."
+        ),
+        epilog="Exemplo:\n  mailtrack new\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.set_defaults(func=new_message)
 
     p = commands.add_parser(
         "create",

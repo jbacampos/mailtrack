@@ -1695,5 +1695,450 @@ class HistoryTest(CliTestCase):
         self.assertNotIn("evento2", tipos)
 
 
+class NewCommandTest(CliTestCase):
+    """N1-N17: assistente `mailtrack new` e ajuda curta."""
+
+    def _run_new(self, respostas):
+        saida, erros = io.StringIO(), io.StringIO()
+        codigo = 0
+        restantes = list(respostas)
+
+        def fake_input(prompt=""):
+            print(prompt, end="")
+            valor = restantes.pop(0)
+            if isinstance(valor, BaseException):
+                raise valor
+            return valor
+
+        with mock.patch("builtins.input", side_effect=fake_input), \
+                contextlib.redirect_stdout(saida), \
+                contextlib.redirect_stderr(erros):
+            try:
+                self._main("new")
+            except SystemExit as exc:
+                codigo = exc.code
+        return saida.getvalue(), erros.getvalue(), codigo
+
+    def _messages_for(self, email):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM messages WHERE recipient=? ORDER BY rowid",
+                (email,),
+            ).fetchall()
+
+    def _photos_for(self, message_id):
+        with self._connect() as db:
+            return db.execute(
+                "SELECT * FROM photos WHERE message_id=? ORDER BY id",
+                (message_id,),
+            ).fetchall()
+
+    def test_n1_ajuda_curta_sem_argumentos(self):
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida):
+            self._main()
+
+        texto = saida.getvalue()
+        self.assertIn(
+            "MAILTRACK — fotografias com histórico de acessos", texto
+        )
+        self.assertIn("mailtrack new", texto)
+        self.assertIn("assistente interativo (recomendado)", texto)
+        self.assertIn("Início rápido:", texto)
+        self.assertIn("mailtrack --help", texto)
+        self.assertNotIn("usage:", texto)
+
+    def test_n2_ajuda_completa_lista_todos_os_comandos(self):
+        saida = io.StringIO()
+
+        with contextlib.redirect_stdout(saida), \
+                self.assertRaises(SystemExit) as contexto:
+            self._main("--help")
+
+        self.assertEqual(contexto.exception.code, 0)
+        texto = saida.getvalue()
+        for comando in (
+            "new", "create", "add-photo", "export-html",
+            "list", "show", "history",
+        ):
+            self.assertIn(comando, texto)
+
+    def test_n3_fluxo_completo_com_arquivo_com_espacos(self):
+        segunda = self._write_image("foto com espaço.jpg", (300, 300))
+        texto, erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos do sítio",
+            str(self.source),
+            str(segunda),
+            "",
+            "S",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Resumo:", texto)
+        self.assertIn("Destinatário: nova@example.com", texto)
+        self.assertIn("Assunto: Fotos do sítio", texto)
+        self.assertIn("Fotografias: 2", texto)
+        self.assertIn("1. foto.jpg", texto)
+        self.assertIn("2. foto com espaço.jpg", texto)
+        self.assertIn("Mensagem criada: MSG-", texto)
+        self.assertIn("HTML gerado:", texto)
+        self.assertIn("Mensagem pronta para uso:", texto)
+        self.assertIn("Gmail", texto)
+        self.assertIn("Outlook", texto)
+        self.assertIn("não envia o e-mail", texto)
+        self.assertNotIn("FALHOU", texto)
+        self.assertNotIn("FALHOU", erros)
+
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+        self.assertEqual(mensagens[0]["subject"], "Fotos do sítio")
+
+        fotos = self._photos_for(message_id)
+        self.assertEqual(
+            [foto["filename"] for foto in fotos],
+            ["foto.jpg", "foto com espaço.jpg"],
+        )
+
+        destino = self.exports / f"{message_id}.html"
+        self.assertTrue(destino.is_file())
+        html = destino.read_text(encoding="utf-8")
+        self.assertIn("Fotos do sítio", html)
+        self.assertIn("foto.jpg", html)
+        self.assertIn("foto com espaço.jpg", html)
+        self.assertIn(str(destino.resolve()), texto)
+
+        self.assertLess(
+            texto.index("Destinatário: "), texto.index("Assunto: ")
+        )
+        self.assertLess(
+            texto.index("Assunto: "),
+            texto.index("Fotografia (Enter para encerrar): "),
+        )
+        self.assertLess(
+            texto.index("Fotografia (Enter para encerrar): "),
+            texto.index("Confirma a criação"),
+        )
+
+    def test_n4_recusa_com_enter_nao_cria_nada(self):
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            str(self.source),
+            "",
+            "",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Resumo:", texto)
+        self.assertIn(
+            "Operação cancelada. Nenhuma mensagem foi criada.", texto
+        )
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n5_email_invalido_repete_ate_valido(self):
+        texto, _erros, codigo = self._run_new([
+            "",
+            "invalido",
+            "a@b@c",
+            "a@b, c@d",
+            "ok@example.com",
+            "Assunto",
+            str(self.source),
+            "",
+            "n",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Informe um destinatário.", texto)
+        self.assertIn(
+            "E-mail inválido. Informe um único endereço de e-mail.", texto
+        )
+        self.assertIn("Operação cancelada.", texto)
+        self.assertEqual(self._messages_for("ok@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+
+    def test_n6_assunto_vazio_e_permitido(self):
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "",
+            str(self.source),
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("(sem assunto)", texto)
+
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+        self.assertEqual(mensagens[0]["subject"], "")
+
+        destino = self.exports / f"{message_id}.html"
+        self.assertIn(
+            "<title>Fotografias</title>",
+            destino.read_text(encoding="utf-8"),
+        )
+
+    def test_n7_caminho_inexistente_permite_corrigir(self):
+        ausente = self.base / "in" / "não existe.jpg"
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            str(ausente),
+            str(self.source),
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn(f"Arquivo não encontrado: {ausente}", texto)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        self.assertEqual(len(self._photos_for(mensagens[0]["id"])), 1)
+
+    def test_n8_imagem_invalida_e_extensao_nao_permitida(self):
+        quebrada = self.base / "in" / "quebrada.jpg"
+        quebrada.write_bytes(b"isto nao e uma imagem")
+        texto_plano = self.base / "in" / "foto.txt"
+        texto_plano.write_text("nao e imagem", encoding="utf-8")
+
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            str(quebrada),
+            str(texto_plano),
+            str(self.source),
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Imagem inválida ou não suportada:", texto)
+        self.assertIn("Formato de imagem não permitido: .txt", texto)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        self.assertEqual(len(self._photos_for(mensagens[0]["id"])), 1)
+
+    def test_n9_nenhuma_foto_aborta_sem_criar(self):
+        texto, erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            "",
+        ])
+
+        self.assertEqual(codigo, 1)
+        self.assertIn("Nenhuma fotografia selecionada.", erros)
+        self.assertIn("Nenhuma mensagem foi criada.", erros)
+        self.assertNotIn("Resumo:", texto)
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n10_ctrl_c_no_inicio_cancela_sem_criar(self):
+        _texto, erros, codigo = self._run_new([KeyboardInterrupt()])
+
+        self.assertEqual(codigo, 130)
+        self.assertIn(
+            "Operação cancelada. Nenhuma mensagem foi criada.", erros
+        )
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n11_eof_cancela_sem_criar(self):
+        _texto, erros, codigo = self._run_new([EOFError()])
+
+        self.assertEqual(codigo, 1)
+        self.assertIn("Entrada encerrada; operação cancelada.", erros)
+        self.assertIn("Nenhuma mensagem foi criada.", erros)
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+
+    def test_n12_falha_parcial_preserva_mensagem_sem_html(self):
+        segunda = self._write_image("falha.jpg", (300, 300))
+        real_add_one = cli._add_one
+
+        def parcial(source, message_id):
+            if source.name == "falha.jpg":
+                raise cli._Abort("falha simulada")
+            return real_add_one(source, message_id)
+
+        with mock.patch.object(cli, "_add_one", side_effect=parcial):
+            _texto, erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                str(self.source),
+                str(segunda),
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 1)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+        self.assertEqual(len(self._photos_for(message_id)), 1)
+        self.assertIn("falha.jpg", erros)
+        self.assertIn("1 de 2 fotografia(s)", erros)
+        self.assertIn("HTML não foi gerado", erros)
+        self.assertIn(f"mailtrack export-html {message_id}", erros)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n13_zero_fotos_descarta_mensagem_vazia(self):
+        segunda = self._write_image("falha.jpg", (300, 300))
+
+        with mock.patch.object(
+            cli, "_add_one", side_effect=cli._Abort("falha simulada")
+        ):
+            _texto, erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                str(self.source),
+                str(segunda),
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 1)
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+        self.assertIn("Nenhuma fotografia foi adicionada.", erros)
+        self.assertIn("recém-criada foi descartada", erros)
+        self.assertIn("HTML não foi gerado", erros)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n14_falha_no_html_preserva_mensagem_e_fotos(self):
+        with mock.patch.object(
+            cli,
+            "_stage_html",
+            side_effect=OSError(errno.ENOSPC, "No space left on device"),
+        ):
+            texto, erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                str(self.source),
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 1)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+        self.assertEqual(len(self._photos_for(message_id)), 1)
+        self.assertIn("Mensagem criada: MSG-", texto)
+        self.assertNotIn("Mensagem pronta para uso:", texto)
+        self.assertIn("HTML não foi gerado", erros)
+        self.assertIn("No space left on device", erros)
+        self.assertIn(f"mailtrack export-html {message_id}", erros)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+        self.assertEqual(self._temps(self.exports), [])
+
+    def test_n15_ctrl_c_durante_inclusao_descarta_mensagem_vazia(self):
+        with mock.patch.object(
+            cli.os, "replace", side_effect=KeyboardInterrupt("ctrl-c")
+        ):
+            texto, erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                str(self.source),
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 130)
+        self.assertEqual(self._messages_for("nova@example.com"), [])
+        self.assertEqual(self._photo_count(), 0)
+        self.assertEqual(self._names(self.photos), [])
+        self.assertEqual(self._names(self.thumbs), [])
+        self.assertIn("Mensagem criada: MSG-", texto)
+        self.assertNotIn("Mensagem pronta para uso:", texto)
+        self.assertIn("Operação cancelada.", erros)
+        self.assertIn("descartada porque nenhuma fotografia", erros)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+    def test_n16_descarte_so_sem_fotos_e_eventos(self):
+        self._nova_mensagem("MSG-VAZIA", "2029-01-01T00:00:00.000Z")
+        self.assertTrue(cli._discard_empty_message("MSG-VAZIA"))
+
+        self._nova_mensagem("MSG-EVENTO", "2029-01-01T00:00:00.000Z")
+        self._insert_event(
+            "message_created", "2029-01-01T00:00:00.000Z",
+            message_id="MSG-EVENTO",
+        )
+        self.assertFalse(cli._discard_empty_message("MSG-EVENTO"))
+
+        self._nova_mensagem("MSG-FOTO", "2029-01-01T00:00:00.000Z")
+        self._insert_photo(
+            "foto.jpg", "ORIG-GUARD", "THUMB-GUARD",
+            message_id="MSG-FOTO",
+        )
+        self.assertFalse(cli._discard_empty_message("MSG-FOTO"))
+
+        with self._connect() as db:
+            existentes = db.execute(
+                "SELECT id FROM messages WHERE id IN "
+                "('MSG-EVENTO', 'MSG-FOTO') ORDER BY id"
+            ).fetchall()
+        self.assertEqual(
+            [row["id"] for row in existentes], ["MSG-EVENTO", "MSG-FOTO"]
+        )
+
+    def test_n17_ctrl_c_apos_primeira_foto_preserva_mensagem(self):
+        segunda = self._write_image("segunda.jpg", (300, 300))
+        real_replace = cli.os.replace
+        chamadas = {"n": 0}
+
+        def replace_interrupt(origem, destino):
+            chamadas["n"] += 1
+            if chamadas["n"] == 3:
+                raise KeyboardInterrupt("ctrl-c")
+            return real_replace(origem, destino)
+
+        with mock.patch.object(
+            cli.os, "replace", side_effect=replace_interrupt
+        ):
+            texto, erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                str(self.source),
+                str(segunda),
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 130)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+
+        fotos = self._photos_for(message_id)
+        self.assertEqual(len(fotos), 1)
+        self.assertEqual(fotos[0]["filename"], "foto.jpg")
+        self.assertTrue(Path(fotos[0]["original_path"]).is_file())
+        self.assertTrue(Path(fotos[0]["thumbnail_path"]).is_file())
+        self.assertEqual(len(self._names(self.photos)), 1)
+        self.assertEqual(len(self._names(self.thumbs)), 1)
+        self.assertEqual(self._temps(self.photos), [])
+        self.assertEqual(self._temps(self.thumbs), [])
+
+        self.assertIn("Mensagem criada: MSG-", texto)
+        self.assertNotIn("Mensagem pronta para uso:", texto)
+        self.assertIn("pode estar incompleta", erros)
+        self.assertIn(message_id, erros)
+        self.assertIn(
+            f"mailtrack add-photo {message_id} FOTO...", erros
+        )
+        self.assertIn(f"mailtrack export-html {message_id}", erros)
+        self.assertEqual(list(self.exports.glob("*.html")), [])
+
+
 if __name__ == "__main__":
     unittest.main()
