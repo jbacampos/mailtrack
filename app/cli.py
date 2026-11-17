@@ -17,14 +17,18 @@ DB = Path("/data/db/mailtrack.sqlite3")
 PHOTOS = Path("/data/photos")
 THUMBS = Path("/data/thumbnails")
 INCOMING = Path("/data/incoming")
+# Caminho correspondente no host, mostrado pelo assistente `new`.
+INCOMING_HOST = "/var/lib/mailtrack/incoming"
 EXPORTS = Path("/data/exports")
+# Caminho correspondente no host, usado na transferência via SCP.
+EXPORTS_HOST = "/var/lib/mailtrack/exports"
 
 BASE_URL = "https://photos.datalog.top"
 ALLOWED = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".tif", ".tiff", ".bmp"}
 
-# Miniatura: arquivo 240x240 (quadrado, corte central) exibido em 120x120 no HTML.
+# Miniatura: arquivo 240x240 (quadrado, corte central) exibido em 72x72 no HTML.
 THUMB_PX = 240
-THUMB_DISPLAY_PX = 120
+THUMB_DISPLAY_PX = 72
 
 VERSION = "0.2.0"
 
@@ -593,23 +597,31 @@ def export_html(args):
             "Execute 'mailtrack add-photo <arquivos>' primeiro."
         )
 
-    blocks = []
+    gallery_rows = []
 
-    for photo in photos:
-        thumb = f"{base_url}/t/{photo['thumbnail_token']}"
-        original = f"{base_url}/o/{photo['original_token']}"
+    for inicio in range(0, len(photos), 3):
+        cells = []
 
-        blocks.append(f"""
-        <p>
-          <a href="{escape(original, quote=True)}">
-            <img src="{escape(thumb, quote=True)}"
-                 alt="{escape(photo['filename'], quote=True)}"
-                 width="{THUMB_DISPLAY_PX}" height="{THUMB_DISPLAY_PX}"
-                 loading="lazy"
-                 style="width:{THUMB_DISPLAY_PX}px;height:{THUMB_DISPLAY_PX}px;object-fit:cover">
-          </a>
-        </p>
-        """)
+        for photo in photos[inicio:inicio + 3]:
+            thumb = f"{base_url}/t/{photo['thumbnail_token']}"
+            original = f"{base_url}/o/{photo['original_token']}"
+
+            cells.append(f"""
+          <td style="padding:0 10px 10px 0;vertical-align:top;">
+            <a href="{escape(original, quote=True)}">
+              <img src="{escape(thumb, quote=True)}"
+                   alt="{escape(photo['filename'], quote=True)}"
+                   width="{THUMB_DISPLAY_PX}" height="{THUMB_DISPLAY_PX}"
+                   loading="lazy"
+                   style="width:{THUMB_DISPLAY_PX}px;height:{THUMB_DISPLAY_PX}px;object-fit:cover">
+            </a>
+          </td>""")
+
+        gallery_rows.append(
+            "      <tr>" + "".join(cells) + "</tr>"
+        )
+
+    gallery = "\n".join(gallery_rows)
 
     html = f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -620,8 +632,11 @@ def export_html(args):
 <body>
 <p>Prezado(a),</p>
 <p>Seguem as fotografias:</p>
-{''.join(blocks)}
 <p>Atenciosamente,</p>
+    <table role="presentation" cellpadding="0" cellspacing="0"
+           border="0" align="left" style="border-collapse:collapse;">
+{gallery}
+    </table>
 </body>
 </html>
 """
@@ -711,15 +726,24 @@ def _ask_photos():
     fotos = []
     while True:
         valor = _ask_input(
-            "Fotografia (Enter para encerrar): "
+            "Fotografia (basta o nome do arquivo; Enter para encerrar): "
         ).strip()
         if not valor:
             break
+
         caminho = Path(valor).expanduser()
+        nome_simples = not caminho.is_absolute()
+        if nome_simples:
+            caminho = INCOMING / caminho
+
         problema = _photo_problem(caminho)
         if problema:
-            print(problema)
+            if nome_simples and not caminho.is_file():
+                print(f"Arquivo não encontrado em {INCOMING}: {valor}")
+            else:
+                print(problema)
             continue
+
         fotos.append(str(caminho))
     return fotos
 
@@ -791,6 +815,15 @@ def _discard_empty_message(message_id):
 
 
 def _run_new(state):
+    print("Copie previamente as fotografias para:")
+    print(f"{INCOMING_HOST}/")
+    print("")
+    print(
+        "Informe abaixo o nome de cada arquivo. "
+        "Pressione ENTER quando terminar."
+    )
+    print("")
+
     recipient = _ask_recipient()
     subject = _ask_subject()
     photos = _ask_photos()
@@ -861,12 +894,20 @@ def _run_new(state):
         )
 
     destino = (EXPORTS / f"{message_id}.html").resolve()
+    destino_host = f"{EXPORTS_HOST}/{destino.name}"
+    comando_scp = (
+        f'scp neo:{destino_host} "$env:USERPROFILE\\Downloads\\"'
+    )
+
     print("")
     print("Mensagem pronta para uso:")
-    print(f"  1. Abra {destino} no navegador.")
-    print("  2. Copie o conteúdo renderizado e cole no corpo do e-mail")
+    print(f"  1. HTML gerado no Neo: {destino_host}")
+    print("  2. No PowerShell do Windows, execute:")
+    print(f"     {comando_scp}")
+    print("  3. Após a transferência, abra o arquivo na pasta Downloads,")
+    print("     copie o conteúdo renderizado e cole no corpo do e-mail")
     print("     no Gmail, Outlook ou outro provedor.")
-    print(f"  3. Envie para {recipient}. O MailTrack não envia o e-mail.")
+    print(f"  4. Envie para {recipient}. O MailTrack não envia o e-mail.")
 
 
 def new_message(args):

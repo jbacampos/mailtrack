@@ -103,7 +103,10 @@ class CliTestCase(unittest.TestCase):
         self.photos = self.base / "photos"
         self.thumbs = self.base / "thumbs"
         self.exports = self.base / "exports"
-        for directory in (self.photos, self.thumbs, self.exports):
+        self.incoming = self.base / "incoming"
+        for directory in (
+            self.photos, self.thumbs, self.exports, self.incoming
+        ):
             directory.mkdir()
 
         self.db_path = self.base / "db" / "mailtrack.sqlite3"
@@ -117,6 +120,7 @@ class CliTestCase(unittest.TestCase):
             ("PHOTOS", self.photos),
             ("THUMBS", self.thumbs),
             ("EXPORTS", self.exports),
+            ("INCOMING", self.incoming),
         ):
             patcher = mock.patch.object(cli, target, value)
             patcher.start()
@@ -156,6 +160,13 @@ class CliTestCase(unittest.TestCase):
 
     def _write_image(self, name, size, mode="RGB", color=(10, 20, 30)):
         path = self.base / "in" / name
+        Image.new(mode, size, color).save(path)
+        return path
+
+    def _write_incoming(self, name, size=(300, 300), mode="RGB",
+                        color=(10, 20, 30)):
+        path = self.incoming / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         Image.new(mode, size, color).save(path)
         return path
 
@@ -752,7 +763,7 @@ class ExportHtmlTest(CliTestCase):
         self.assertIn("https://photos.example/o/ORIG2", conteudo)
         self.assertIn("Fotos &amp; Cia", conteudo)
         self.assertIn("ORIG1.jpg", conteudo)
-        self.assertIn('width="120" height="120"', conteudo)
+        self.assertIn('width="72" height="72"', conteudo)
         self.assertIn("object-fit:cover", conteudo)
         self.assertIn('loading="lazy"', conteudo)
         self.assertEqual(self._names(self.exports), [destino.name])
@@ -898,11 +909,64 @@ class ExportHtmlTest(CliTestCase):
             encoding="utf-8"
         )
 
-        self.assertIn('width="120" height="120"', html)
+        self.assertIn('width="72" height="72"', html)
         self.assertIn("object-fit:cover", html)
         self.assertIn("https://photos.example/t/THUMBLEG", html)
         self.assertEqual(legado.read_bytes(), conteudo_antes)
         self.assertEqual(legado.stat().st_mtime_ns, mtime_antes)
+
+
+    def test_t29_galeria_72px_depois_da_assinatura(self):
+        self._add_photo_rows()
+        cli.export_html(self._export_args())
+        html = (self.exports / f"{self.message_id}.html").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('width="72" height="72"', html)
+        self.assertIn("width:72px;height:72px", html)
+        self.assertNotIn('width="120"', html)
+        self.assertLess(
+            html.index("<p>Seguem as fotografias:</p>"),
+            html.index("<p>Atenciosamente,</p>"),
+        )
+        self.assertRegex(
+            html,
+            r"<p>Atenciosamente,</p>\s*<table[^>]*align=\"left\"",
+        )
+        self.assertIn('href="https://photos.example/o/ORIG1"', html)
+        self.assertIn('href="https://photos.example/o/ORIG2"', html)
+        self.assertIn('loading="lazy"', html)
+        self.assertIn("padding:0 10px 10px 0", html)
+        self.assertNotIn("display:flex", html)
+        self.assertNotIn("display:grid", html)
+
+    def test_t30_galeria_distribui_ate_tres_por_linha(self):
+        total = 7
+        self._add_photo_rows(rows=tuple(
+            (f"ORIG{i}", f"THUMB{i}") for i in range(1, total + 1)
+        ))
+
+        cli.export_html(self._export_args())
+        html = (self.exports / f"{self.message_id}.html").read_text(
+            encoding="utf-8"
+        )
+
+        linhas = re.findall(r"<tr>(.*?)</tr>", html, re.DOTALL)
+        self.assertEqual(len(linhas), 3)
+        self.assertEqual(
+            [linha.count("<td") for linha in linhas], [3, 3, 1]
+        )
+        for linha in linhas:
+            self.assertLessEqual(linha.count("<td"), 3)
+
+        for numero in range(1, total + 1):
+            self.assertIn(
+                f"https://photos.example/o/ORIG{numero}", html
+            )
+            self.assertIn(
+                f"https://photos.example/t/THUMB{numero}", html
+            )
 
 
 class CliInterfaceTest(CliTestCase):
@@ -1815,10 +1879,16 @@ class NewCommandTest(CliTestCase):
         )
         self.assertLess(
             texto.index("Assunto: "),
-            texto.index("Fotografia (Enter para encerrar): "),
+            texto.index(
+                "Fotografia (basta o nome do arquivo; "
+                "Enter para encerrar): "
+            ),
         )
         self.assertLess(
-            texto.index("Fotografia (Enter para encerrar): "),
+            texto.index(
+                "Fotografia (basta o nome do arquivo; "
+                "Enter para encerrar): "
+            ),
             texto.index("Confirma a criação"),
         )
 
@@ -2138,6 +2208,189 @@ class NewCommandTest(CliTestCase):
         )
         self.assertIn(f"mailtrack export-html {message_id}", erros)
         self.assertEqual(list(self.exports.glob("*.html")), [])
+
+
+    def test_n18_nome_simples_encontrado_em_incoming(self):
+        origem = self._write_incoming("simples.jpg", (400, 300))
+        conteudo = origem.read_bytes()
+
+        texto, erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            "simples.jpg",
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Copie previamente as fotografias para:", texto)
+        self.assertIn("/var/lib/mailtrack/incoming/", texto)
+        self.assertLess(
+            texto.index("Copie previamente as fotografias para:"),
+            texto.index("Destinatário: "),
+        )
+        self.assertIn(
+            "Informe abaixo o nome de cada arquivo. "
+            "Pressione ENTER quando terminar.",
+            texto,
+        )
+        self.assertIn(
+            "Fotografia (basta o nome do arquivo; "
+            "Enter para encerrar): ",
+            texto,
+        )
+        self.assertIn("Fotografias: 1", texto)
+        self.assertNotIn("FALHOU", erros)
+
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual(
+            [foto["filename"] for foto in fotos], ["simples.jpg"]
+        )
+        self.assertTrue(Path(fotos[0]["original_path"]).is_file())
+        self.assertTrue(Path(fotos[0]["thumbnail_path"]).is_file())
+
+        # O arquivo em incoming é apenas lido, nunca alterado.
+        self.assertTrue(origem.is_file())
+        self.assertEqual(origem.read_bytes(), conteudo)
+        self.assertEqual(self._names(self.incoming), ["simples.jpg"])
+
+    def test_n19_caminho_absoluto_continua_aceito(self):
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            str(self.source),
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual([foto["filename"] for foto in fotos], ["foto.jpg"])
+
+    def test_n20_nome_inexistente_em_incoming_permite_corrigir(self):
+        self._write_incoming("existe.jpg")
+
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            "nao-existe.jpg",
+            "existe.jpg",
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn(
+            f"Arquivo não encontrado em {self.incoming}: nao-existe.jpg",
+            texto,
+        )
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual([foto["filename"] for foto in fotos], ["existe.jpg"])
+
+    def test_n21_nome_com_espacos_em_incoming(self):
+        self._write_incoming("foto do sítio.jpg")
+
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            "foto do sítio.jpg",
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual(
+            [foto["filename"] for foto in fotos], ["foto do sítio.jpg"]
+        )
+
+    def test_n22_arquivo_invalido_em_incoming_e_rejeitado(self):
+        quebrada = self.incoming / "quebrada.jpg"
+        quebrada.write_bytes(b"isto nao e uma imagem")
+        texto_plano = self.incoming / "foto.txt"
+        texto_plano.write_text("nao e imagem", encoding="utf-8")
+        self._write_incoming("valida.jpg")
+
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            "quebrada.jpg",
+            "foto.txt",
+            "valida.jpg",
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Imagem inválida ou não suportada:", texto)
+        self.assertIn("Formato de imagem não permitido: .txt", texto)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual([foto["filename"] for foto in fotos], ["valida.jpg"])
+
+    def test_n23_expansao_de_til_continua_aceita(self):
+        home = self.base / "home"
+        pasta = home / "fotos"
+        pasta.mkdir(parents=True)
+        shutil.copy(self.source, pasta / "foto.jpg")
+
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            texto, _erros, codigo = self._run_new([
+                "nova@example.com",
+                "Fotos",
+                "~/fotos/foto.jpg",
+                "",
+                "s",
+            ])
+
+        self.assertEqual(codigo, 0)
+        self.assertIn("Fotografias: 1", texto)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        fotos = self._photos_for(mensagens[0]["id"])
+        self.assertEqual([foto["filename"] for foto in fotos], ["foto.jpg"])
+
+
+    def test_n24_comando_scp_usa_id_real_da_mensagem(self):
+        texto, _erros, codigo = self._run_new([
+            "nova@example.com",
+            "Fotos",
+            str(self.source),
+            "",
+            "s",
+        ])
+
+        self.assertEqual(codigo, 0)
+        mensagens = self._messages_for("nova@example.com")
+        self.assertEqual(len(mensagens), 1)
+        message_id = mensagens[0]["id"]
+
+        arquivo_host = f"/var/lib/mailtrack/exports/{message_id}.html"
+        comando = (
+            f"scp neo:{arquivo_host} "
+            '"$env:USERPROFILE\\Downloads\\"'
+        )
+
+        self.assertIn(f"HTML gerado no Neo: {arquivo_host}", texto)
+        self.assertIn("No PowerShell do Windows, execute:", texto)
+        self.assertIn(comando, texto)
+        self.assertIn("abra o arquivo na pasta Downloads", texto)
+        self.assertIn("copie o conteúdo", texto)
+        self.assertIn("O MailTrack não envia o e-mail.", texto)
+        self.assertNotIn("no navegador", texto)
 
 
 if __name__ == "__main__":
