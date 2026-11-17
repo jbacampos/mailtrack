@@ -647,10 +647,83 @@ def export_html(args):
     )
 
 
+# Rótulos curtos para os tipos de evento registrados pela aplicação.
+_EVENT_LABELS = {
+    "thumbnail_requested": "Miniatura",
+    "original_requested": "Original",
+}
+
+
+def _format_event_time(value):
+    """Data e hora do evento no fuso local, em formato compacto."""
+    momento = _parse_timestamp(value)
+    if momento is None:
+        return str(value).strip() if value else None
+    return momento.astimezone().strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _summarize_user_agent(value):
+    """Resumo de navegador e sistema, sem despejar o User-Agent completo."""
+    if not value:
+        return None
+
+    texto = str(value).lower()
+
+    if "edg/" in texto or "edge/" in texto:
+        navegador = "Edge"
+    elif "opr/" in texto or "opera" in texto:
+        navegador = "Opera"
+    elif "firefox/" in texto:
+        navegador = "Firefox"
+    elif "chrome/" in texto or "crios/" in texto:
+        navegador = "Chrome"
+    elif "safari/" in texto:
+        navegador = "Safari"
+    elif "curl/" in texto:
+        navegador = "curl"
+    else:
+        navegador = None
+
+    if "windows nt" in texto:
+        sistema = "Windows"
+    elif "android" in texto:
+        sistema = "Android"
+    elif "iphone" in texto or "ipad" in texto or "ipod" in texto:
+        sistema = "iOS"
+    elif "mac os x" in texto or "macintosh" in texto:
+        sistema = "macOS"
+    elif "linux" in texto or "x11" in texto:
+        sistema = "Linux"
+    else:
+        sistema = None
+
+    partes = [parte for parte in (navegador, sistema) if parte]
+    return " / ".join(partes) if partes else None
+
+
+def _event_label(event_type):
+    """Descrição curta do tipo; tipos desconhecidos são preservados."""
+    return _EVENT_LABELS.get(event_type, event_type)
+
+
+def _event_line(row):
+    """Uma linha compacta por evento, omitindo campos vazios."""
+    ip = row["remote_ip"] or row["client_ip"]
+    partes = (
+        _format_event_time(row["occurred_at"]),
+        row["filename"],
+        _event_label(row["event_type"]),
+        f"IP {ip}" if ip else None,
+        _summarize_user_agent(row["user_agent"]),
+    )
+    return " | ".join(parte for parte in partes if parte)
+
+
 def history(args):
     message_id = resolve_message(getattr(args, "message", None))
     limite = _validar_limite(getattr(args, "limit", 20), permitir_zero=True)
-    resumo = getattr(args, "summary", False)
+    # `--summary` continua aceito por compatibilidade: o formato padrão já
+    # é uma linha compacta por evento.
 
     sql = """
         SELECT e.*, p.filename
@@ -667,6 +740,10 @@ def history(args):
 
     with connect() as db:
         rows = db.execute(sql, tuple(parametros)).fetchall()
+        message = db.execute(
+            "SELECT subject FROM messages WHERE id=?",
+            (message_id,),
+        ).fetchone()
 
     if not rows:
         print("Nenhum evento registrado.")
@@ -675,23 +752,14 @@ def history(args):
     if limite:
         rows = list(reversed(rows))
 
+    print("MAILTRACK — HISTÓRICO DE ACESSOS")
+    print(f"Mensagem: {message_id}")
+    if message is not None and message["subject"]:
+        print(f"Assunto: {message['subject']}")
+    print("")
+
     for row in rows:
-        print(
-            f"{row['occurred_at']} | "
-            f"{row['event_type']} | "
-            f"{row['filename'] or '-'}"
-        )
-
-        if resumo:
-            continue
-
-        print(f"  IP visitante (Cloudflare): {row['remote_ip'] or '-'}")
-        print(f"  IP da conexão:             {row['client_ip'] or '-'}")
-        print(f"  Cloudflare Ray:            {row['cf_ray'] or '-'}")
-        print(f"  País informado:            {row['cf_country'] or '-'}")
-        print(f"  X-Forwarded-For:           {row['forwarded_for'] or '-'}")
-        print(f"  Referer:                   {row['referer'] or '-'}")
-        print(f"  User-Agent:                {row['user_agent'] or '-'}")
+        print(_event_line(row))
 
 
 def _positive_int(value):
@@ -856,7 +924,10 @@ def main():
     p.add_argument(
         "--summary",
         action="store_true",
-        help="uma linha compacta por evento",
+        help=(
+            "mantido por compatibilidade; a saída padrão já é "
+            "uma linha compacta por evento"
+        ),
     )
     p.set_defaults(func=history)
 

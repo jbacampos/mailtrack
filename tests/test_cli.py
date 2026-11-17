@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -172,6 +173,53 @@ class CliTestCase(unittest.TestCase):
                 "VALUES (?, ?, ?, ?)",
                 (msg_id, recipient, subject, quando)
             )
+
+    def _insert_photo(self, filename, original, thumb, message_id=None):
+        with self._connect() as db:
+            cursor = db.execute(
+                "INSERT INTO photos (message_id, original_token, "
+                "thumbnail_token, filename, original_path, "
+                "thumbnail_path) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    message_id or self.message_id,
+                    original,
+                    thumb,
+                    filename,
+                    f"/data/photos/{original}.jpg",
+                    f"/data/thumbnails/{thumb}.jpg",
+                ),
+            )
+            return cursor.lastrowid
+
+    def _insert_event(
+        self,
+        event_type,
+        occurred_at,
+        photo_id=None,
+        remote_ip=None,
+        client_ip=None,
+        user_agent=None,
+        message_id=None,
+    ):
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO events (message_id, photo_id, event_type, "
+                "occurred_at, remote_ip, client_ip, user_agent) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id or self.message_id,
+                    photo_id,
+                    event_type,
+                    occurred_at,
+                    remote_ip,
+                    client_ip,
+                    user_agent,
+                ),
+            )
+
+    @staticmethod
+    def _event_lines(texto):
+        return [linha for linha in texto.splitlines() if " | " in linha]
 
     def _main(self, *argv):
         with mock.patch.object(sys, "argv", ["mailtrack", *argv]):
@@ -1154,15 +1202,16 @@ class CliInterfaceTest(CliTestCase):
             ))
 
         texto = saida.getvalue()
-        linhas = [linha for linha in texto.splitlines() if linha]
+        linhas = self._event_lines(texto)
         self.assertEqual(len(linhas), 2)
         # Os 2 mais recentes, exibidos em ordem cronológica.
         self.assertIn("evento4", linhas[0])
         self.assertIn("evento5", linhas[1])
         self.assertNotIn("evento1", texto)
         self.assertNotIn("IP visitante", texto)
+        self.assertIn("MAILTRACK — HISTÓRICO DE ACESSOS", texto)
 
-    def test_ct19_history_padrao_detalhado(self):
+    def test_ct19_history_padrao_compacto(self):
         with self._connect() as db:
             db.execute(
                 "INSERT INTO events (message_id, event_type) VALUES (?, ?)",
@@ -1174,9 +1223,13 @@ class CliInterfaceTest(CliTestCase):
             cli.history(types.SimpleNamespace(message=self.message_id))
 
         texto = saida.getvalue()
-        self.assertIn("thumbnail_requested", texto)
-        self.assertIn("IP visitante (Cloudflare):", texto)
-        self.assertIn("User-Agent:", texto)
+        self.assertIn("MAILTRACK — HISTÓRICO DE ACESSOS", texto)
+        self.assertIn(f"Mensagem: {self.message_id}", texto)
+        self.assertIn(f"Assunto: {self.subject}", texto)
+        self.assertIn("Miniatura", texto)
+        self.assertNotIn("thumbnail_requested", texto)
+        self.assertNotIn("IP visitante", texto)
+        self.assertNotIn("User-Agent:", texto)
 
 
     def test_ct20_version(self):
@@ -1285,7 +1338,7 @@ class CliInterfaceTest(CliTestCase):
         with contextlib.redirect_stdout(saida):
             self._main("history", "--limit", "0", "--summary")
 
-        linhas = [linha for linha in saida.getvalue().splitlines() if linha]
+        linhas = self._event_lines(saida.getvalue())
         self.assertEqual(len(linhas), 3)
         self.assertIn("evento1", saida.getvalue())
         self.assertIn("evento3", saida.getvalue())
@@ -1326,6 +1379,320 @@ class CliInterfaceTest(CliTestCase):
         self.assertIn("Erro operacional (OperationalError)", texto)
         self.assertIn("database is locked", texto)
         self.assertNotIn("Traceback", texto)
+
+
+class HistoryTest(CliTestCase):
+    """H1-H14: formato compacto do histórico de acessos."""
+
+    def _history(self, *argv):
+        saida = io.StringIO()
+        with contextlib.redirect_stdout(saida):
+            self._main("history", *argv)
+        return saida.getvalue()
+
+    @staticmethod
+    def _restaurar_tz(anterior):
+        if anterior is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = anterior
+        time.tzset()
+
+    def test_h1_multiplos_acessos_formato_compacto(self):
+        foto1 = self._insert_photo("foto1.jpg", "ORIG1", "THUMB1")
+        foto2 = self._insert_photo("foto2.jpg", "ORIG2", "THUMB2")
+        chrome_windows = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:42:15.000Z",
+            photo_id=foto1,
+            remote_ip="200.100.10.20",
+            client_ip="172.19.0.1",
+            user_agent=chrome_windows,
+        )
+        self._insert_event(
+            "thumbnail_requested", "2026-11-16T21:42:18.000Z",
+            photo_id=foto1,
+            remote_ip="200.100.10.20",
+            client_ip="172.19.0.1",
+            user_agent=chrome_windows,
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:45:03.000Z",
+            photo_id=foto2,
+            remote_ip="189.20.30.40",
+        )
+
+        texto = self._history(self.message_id)
+
+        self.assertIn("MAILTRACK — HISTÓRICO DE ACESSOS", texto)
+        self.assertIn(f"Mensagem: {self.message_id}", texto)
+        self.assertIn(f"Assunto: {self.subject}", texto)
+
+        linhas = self._event_lines(texto)
+        self.assertEqual(len(linhas), 3)
+        partes = [parte.strip() for parte in linhas[0].split(" | ")]
+        self.assertRegex(
+            partes[0], r"^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$"
+        )
+        self.assertEqual(
+            partes[1:],
+            [
+                "foto1.jpg",
+                "Original",
+                "IP 200.100.10.20",
+                "Chrome / Windows",
+            ],
+        )
+        self.assertIn("| foto1.jpg | Miniatura |", linhas[1])
+        self.assertIn("| foto2.jpg | Original |", linhas[2])
+        self.assertNotIn("172.19.0.1", texto)
+        self.assertNotIn("Mozilla/5.0", texto)
+
+    def test_h2_identifica_miniatura_e_original(self):
+        foto = self._insert_photo("foto.jpg", "ORIG-H2", "THUMB-H2")
+        self._insert_event(
+            "thumbnail_requested", "2026-11-16T21:00:00.000Z",
+            photo_id=foto,
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:01.000Z",
+            photo_id=foto,
+        )
+
+        texto = self._history(self.message_id)
+        linhas = self._event_lines(texto)
+
+        self.assertIn("| Miniatura", linhas[0])
+        self.assertIn("| Original", linhas[1])
+        self.assertNotIn("thumbnail_requested", texto)
+        self.assertNotIn("original_requested", texto)
+
+    def test_h3_nome_original_do_arquivo(self):
+        foto = self._insert_photo(
+            "Fotos do sítio.jpg", "ORIG-H3", "THUMB-H3"
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:00.000Z",
+            photo_id=foto,
+        )
+
+        texto = self._history(self.message_id)
+        self.assertIn("| Fotos do sítio.jpg | Original", texto)
+
+    def test_h4_ip_disponivel_e_ausente(self):
+        foto = self._insert_photo("foto.jpg", "ORIG-H4", "THUMB-H4")
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:00.000Z",
+            photo_id=foto,
+            remote_ip="203.0.113.9",
+            client_ip="172.19.0.1",
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:01.000Z",
+            photo_id=foto,
+            client_ip="10.0.0.5",
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:02.000Z",
+            photo_id=foto,
+        )
+
+        texto = self._history(self.message_id)
+        linhas = self._event_lines(texto)
+
+        self.assertIn("IP 203.0.113.9", linhas[0])
+        self.assertNotIn("172.19.0.1", linhas[0])
+        self.assertIn("IP 10.0.0.5", linhas[1])
+        self.assertNotIn("IP ", linhas[2])
+        self.assertNotIn("IP -", texto)
+
+    def test_h5_user_agent_disponivel_ausente_e_resumido(self):
+        foto = self._insert_photo("foto.jpg", "ORIG-H5", "THUMB-H5")
+        agentes = (
+            (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36"
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko "
+                "Firefox/11.0 (via ggpht.com GoogleImageProxy)"
+            ),
+            (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/42.0.2311.135 Safari/537.36 Edge/12.246"
+            ),
+            None,
+        )
+        for indice, agente in enumerate(agentes):
+            self._insert_event(
+                "original_requested",
+                f"2026-11-16T21:00:0{indice}.000Z",
+                photo_id=foto,
+                user_agent=agente,
+            )
+
+        texto = self._history(self.message_id)
+        linhas = self._event_lines(texto)
+
+        self.assertIn("Chrome / Linux", linhas[0])
+        self.assertIn("Chrome / Android", linhas[1])
+        self.assertIn("Firefox / Windows", linhas[2])
+        self.assertIn("Edge / Windows", linhas[3])
+        self.assertEqual(len(linhas[4].split(" | ")), 3)
+        self.assertNotIn("Mozilla/5.0", texto)
+
+    def test_h6_eventos_desconhecidos_sao_preservados(self):
+        self._insert_event(
+            "message_created", "2026-11-16T21:00:00.000Z"
+        )
+
+        texto = self._history(self.message_id)
+        linhas = self._event_lines(texto)
+
+        self.assertEqual(len(linhas), 1)
+        self.assertIn("| message_created", linhas[0])
+        self.assertNotIn(" | -", linhas[0])
+
+    def test_h7_ordem_cronologica(self):
+        for nome, quando in (
+            ("fotoC.jpg", "2026-11-16T21:03:00.000Z"),
+            ("fotoA.jpg", "2026-11-16T21:01:00.000Z"),
+            ("fotoB.jpg", "2026-11-16T21:02:00.000Z"),
+        ):
+            foto = self._insert_photo(
+                nome, f"ORIG-{nome}", f"THUMB-{nome}"
+            )
+            self._insert_event(
+                "original_requested", quando, photo_id=foto
+            )
+
+        # Empate no horário: o id desempata na ordem crescente.
+        foto_b2 = self._insert_photo("fotoB2.jpg", "ORIG-B2", "THUMB-B2")
+        self._insert_event(
+            "original_requested", "2026-11-16T21:02:00.000Z",
+            photo_id=foto_b2,
+        )
+
+        linhas = self._event_lines(self._history(self.message_id))
+        nomes = [linha.split(" | ")[1].strip() for linha in linhas]
+        self.assertEqual(
+            nomes,
+            ["fotoA.jpg", "fotoB.jpg", "fotoB2.jpg", "fotoC.jpg"],
+        )
+
+    def test_h8_limit_e_limit_zero(self):
+        for indice in range(1, 6):
+            self._insert_event(
+                f"evento{indice}",
+                f"2026-11-{10 + indice:02d}T00:00:00.000Z",
+            )
+
+        limitados = self._event_lines(self._history("--limit", "2"))
+        self.assertEqual(len(limitados), 2)
+        self.assertIn("evento4", limitados[0])
+        self.assertIn("evento5", limitados[1])
+
+        todos = self._event_lines(self._history("--limit", "0"))
+        self.assertEqual(len(todos), 5)
+        self.assertIn("evento1", todos[0])
+        self.assertIn("evento5", todos[-1])
+
+    def test_h9_historico_sem_id_usa_ultima_mensagem(self):
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:00.000Z"
+        )
+        self._nova_mensagem(
+            "MSG-NOVA", "2030-01-01T00:00:00.000Z", subject="Assunto novo"
+        )
+        foto = self._insert_photo(
+            "nova.jpg", "ORIG-NOVA", "THUMB-NOVA", message_id="MSG-NOVA"
+        )
+        self._insert_event(
+            "thumbnail_requested", "2026-11-16T22:00:00.000Z",
+            photo_id=foto,
+            message_id="MSG-NOVA",
+        )
+
+        texto = self._history()
+
+        self.assertIn("Mensagem: MSG-NOVA", texto)
+        self.assertIn("Assunto: Assunto novo", texto)
+        self.assertIn("nova.jpg", texto)
+        self.assertNotIn(self.message_id, texto)
+
+    def test_h10_summary_compativel(self):
+        foto = self._insert_photo("foto.jpg", "ORIG-H10", "THUMB-H10")
+        self._insert_event(
+            "thumbnail_requested", "2026-11-16T21:00:00.000Z",
+            photo_id=foto,
+            remote_ip="203.0.113.10",
+        )
+        self._insert_event(
+            "original_requested", "2026-11-16T21:00:01.000Z",
+            photo_id=foto,
+            remote_ip="203.0.113.10",
+        )
+
+        sem_resumo = self._history("--limit", "0")
+        com_resumo = self._history("--limit", "0", "--summary")
+        self.assertEqual(com_resumo, sem_resumo)
+
+    def test_h11_data_hora_no_fuso_local(self):
+        anterior = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        time.tzset()
+        self.addCleanup(self._restaurar_tz, anterior)
+
+        self._insert_event(
+            "original_requested", "2026-11-16T21:42:15.000Z"
+        )
+
+        self.assertIn("16/11/2026 21:42:15", self._history(self.message_id))
+
+    def test_h12_sem_eventos(self):
+        texto = self._history(self.message_id)
+
+        self.assertIn("Nenhum evento registrado.", texto)
+        self.assertNotIn("MAILTRACK", texto)
+
+    def test_h13_campos_vazios_nao_aparecem(self):
+        self._insert_event(
+            "message_created", "2026-11-16T21:42:15.000Z"
+        )
+
+        texto = self._history(self.message_id)
+        linha = self._event_lines(texto)[0]
+
+        self.assertEqual(len(linha.split(" | ")), 2)
+        self.assertNotIn(" | -", linha)
+        self.assertNotIn("IP -", texto)
+        self.assertNotIn("User-Agent", texto)
+
+    def test_h14_limit_padrao_20(self):
+        for indice in range(1, 23):
+            self._insert_event(
+                f"evento{indice}",
+                f"2026-11-16T21:{indice:02d}:00.000Z",
+            )
+
+        texto = self._history(self.message_id)
+        linhas = self._event_lines(texto)
+
+        self.assertEqual(len(linhas), 20)
+        self.assertIn("evento3", linhas[0])
+        self.assertIn("evento22", linhas[-1])
+        tipos = [linha.split(" | ")[-1] for linha in linhas]
+        self.assertNotIn("evento1", tipos)
+        self.assertNotIn("evento2", tipos)
 
 
 if __name__ == "__main__":
