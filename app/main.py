@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 DB_PATH = Path(os.getenv("MAILTRACK_DB", "/data/db/mailtrack.sqlite3"))
 PHOTO_DIR = Path(os.getenv("MAILTRACK_PHOTOS", "/data/photos"))
@@ -140,6 +140,170 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan
 )
+
+
+LANDING_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Thumbmails — Photos made easy to share</title>
+  <meta name="description" content="Thumbmails is a photo-sharing service that makes it easy to include photographs in email messages without attaching large files.">
+  <meta name="theme-color" content="#f5f7f9">
+  <style>
+    :root {
+      color-scheme: light;
+      --background: #f5f7f9;
+      --surface: #ffffff;
+      --text: #1f2933;
+      --muted: #5b6773;
+      --accent: #2f6f8f;
+      --accent-soft: #e8f0f4;
+      --border: #e3e7eb;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2.5rem 1.25rem;
+      background: var(--background);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Helvetica, Arial, sans-serif;
+      font-size: 1rem;
+      line-height: 1.65;
+    }
+
+    main {
+      width: 100%;
+      max-width: 40rem;
+      padding: clamp(2rem, 6vw, 3.5rem);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 1rem;
+      box-shadow: 0 1px 2px rgba(31, 41, 51, 0.04),
+        0 16px 40px rgba(31, 41, 51, 0.06);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1.75rem;
+    }
+
+    .mark {
+      display: grid;
+      grid-template-columns: repeat(2, 0.5rem);
+      grid-template-rows: repeat(2, 0.5rem);
+      gap: 0.1875rem;
+      padding: 0.375rem;
+      border-radius: 0.5rem;
+      background: var(--accent-soft);
+      flex: none;
+    }
+
+    .mark span {
+      display: block;
+      border-radius: 0.125rem;
+      background: var(--accent);
+    }
+
+    .mark span:nth-child(2),
+    .mark span:nth-child(3) {
+      opacity: 0.55;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.5rem, 4vw, 1.875rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+
+    .tagline {
+      margin: 0 0 1rem;
+      font-size: clamp(1.125rem, 3vw, 1.375rem);
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .lead,
+    .about {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .lead {
+      font-size: 1.0625rem;
+    }
+
+    .promise {
+      margin: 1.75rem 0;
+      padding: 0.875rem 1rem;
+      border-left: 3px solid var(--accent);
+      background: var(--accent-soft);
+      border-radius: 0 0.375rem 0.375rem 0;
+      font-weight: 600;
+    }
+
+    .about {
+      font-size: 0.9375rem;
+    }
+
+    @media (max-width: 30rem) {
+      body {
+        padding: 1rem;
+        align-items: flex-start;
+      }
+
+      main {
+        padding: 1.75rem 1.25rem;
+        border-radius: 0.75rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="brand">
+      <span class="mark" aria-hidden="true">
+        <span></span>
+        <span></span>
+        <span></span>
+        <span></span>
+      </span>
+      <h1>Thumbmails</h1>
+    </header>
+    <p class="tagline">Photos made easy to share.</p>
+    <p class="lead">Share your photos through beautiful, clickable
+      thumbnails. Recipients can view the original images with a single
+      click.</p>
+    <p class="promise">Simple. Direct. No attachments required.</p>
+    <p class="about">Thumbmails is a photo-sharing service that makes it
+      easy to include photographs in email messages without attaching
+      large files.</p>
+  </main>
+</body>
+</html>
+"""
+
+
+@app.get("/")
+def landing_page():
+    return HTMLResponse(content=LANDING_PAGE)
 
 
 @app.get("/health")
